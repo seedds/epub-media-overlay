@@ -224,7 +224,7 @@ def parse_args() -> PipelineConfig:
     )
     parser.add_argument(
         "--model",
-        default="mlx-community/whisper-large-v3-turbo",
+        default="mlx-community/whisper-turbo",
         help="WhisperX model identifier",
     )
     parser.add_argument("--language", default="en", help="Transcription language code")
@@ -564,17 +564,11 @@ def run_transcribe_stage(
     logger: logging.Logger,
 ) -> dict[str, Any]:
     book_info = build_book_info(state, paths)
-    original_transcribe = legacy.transcribe
+    book_info["model"] = config.model
+    book_info["language"] = config.language
 
-    def configured_transcribe(file_name: str, model: str | None = None, language: str | None = None):
-        return original_transcribe(file_name, model=config.model, language=config.language)
-
-    legacy.transcribe = configured_transcribe
-    try:
-        with pushd(paths.run_dir):
-            legacy.transcribe_audio(book_info)
-    finally:
-        legacy.transcribe = original_transcribe
+    with pushd(paths.run_dir):
+        legacy.transcribe_audio(book_info)
 
     audio_files = state.get("artifacts", {}).get("audio_files") or sorted(
         path.name for path in paths.run_dir.glob(f"*{config.audio_extension}")

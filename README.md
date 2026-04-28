@@ -38,6 +38,21 @@ python generate_epub_overlay.py \
   --epub /path/to/book.epub
 ```
 
+Transcription defaults:
+
+- model: `mlx-community/whisper-turbo`
+- language: `en`
+
+Override them when needed:
+
+```bash
+python generate_epub_overlay.py \
+  --m4b /path/to/book.m4b \
+  --epub /path/to/book.epub \
+  --model mlx-community/whisper-large-v3-turbo \
+  --language en
+```
+
 Run behavior:
 
 - if compatible work already exists, the pipeline resumes automatically

@@ -438,13 +438,16 @@ def transcribe_audio(book_info):
     # Transcription is per split audio chunk, not against the original `.m4b`. The
     # sibling JSON files become the canonical transcript inputs for both matching and
     # fine-grained timestamp alignment.
+    model = book_info.get("model") or "mlx-community/whisper-turbo"
+    language = book_info.get("language") or "en"
+
     for file in sorted(glob.glob(f"*{book_info['audio_extension']}")):
         if not os.path.exists(file.replace(book_info["audio_extension"], ".json")):
             print("✅ " + file)
             result = transcribe(
                 file,
-                model='mlx-community/whisper-large-v3-turbo',
-                language='en',
+                model=model,
+                language=language,
             )
             with open(file.replace(book_info["audio_extension"], ".json"), 'w', encoding="utf-8") as f:
                 json.dump(result, f, ensure_ascii=False)
