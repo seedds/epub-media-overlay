@@ -41,8 +41,7 @@ Basic run:
 ```bash
 python generate_epub_overlay.py \
   --m4b /path/to/book.m4b \
-  --epub /path/to/book.epub \
-  --output-dir /path/to/output
+  --epub /path/to/book.epub
 ```
 
 Run behavior:
@@ -50,6 +49,7 @@ Run behavior:
 - if compatible work already exists, the pipeline resumes automatically
 - if no work exists yet, the pipeline starts from the beginning
 - use `--fresh` only when you want to discard previous work and restart from scratch
+- if `--output-dir` is omitted, the final EPUB is written next to the source EPUB
 
 Restart from scratch:
 
@@ -57,7 +57,6 @@ Restart from scratch:
 python generate_epub_overlay.py \
   --m4b /path/to/book.m4b \
   --epub /path/to/book.epub \
-  --output-dir /path/to/output \
   --fresh
 ```
 
@@ -79,10 +78,11 @@ These stage names are shown in the log output so users can follow progress, but 
 Final output:
 
 - `<book-stem>.media-overlay.epub`
+- default location: the source EPUB folder
 
 Working directory default:
 
-- `<output-dir>/.<book-stem>.epubmo`
+- `<resolved-output-dir>/.<book-stem>.epubmo`
 
 Important working artifacts:
 

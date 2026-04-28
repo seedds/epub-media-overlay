@@ -214,7 +214,10 @@ def parse_args() -> PipelineConfig:
     )
     parser.add_argument("--m4b", required=True, help="Input .m4b audiobook file")
     parser.add_argument("--epub", required=True, help="Input .epub ebook file")
-    parser.add_argument("--output-dir", required=True, help="Directory for the final EPUB")
+    parser.add_argument(
+        "--output-dir",
+        help="Directory for the final EPUB. Defaults to the source EPUB folder",
+    )
     parser.add_argument(
         "--work-dir",
         help="Working directory used for persistent state and intermediate artifacts",
@@ -239,7 +242,11 @@ def parse_args() -> PipelineConfig:
 
     m4b = Path(args.m4b).expanduser().resolve()
     epub = Path(args.epub).expanduser().resolve()
-    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir = (
+        Path(args.output_dir).expanduser().resolve()
+        if args.output_dir
+        else epub.parent
+    )
     work_dir = (
         Path(args.work_dir).expanduser().resolve()
         if args.work_dir
