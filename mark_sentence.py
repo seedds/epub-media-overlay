@@ -146,6 +146,8 @@ serializer/parser interactions around footnotes or appendix markup.
 """
 
 import re
+import logging
+from pathlib import Path
 from bs4 import (
     BeautifulSoup,
     NavigableString,
@@ -159,21 +161,70 @@ from nltk.tokenize.punkt import PunktParameters, PunktSentenceTokenizer
 from typing import List, Tuple, Union
 
 
-def ensure_nltk_resources() -> None:
+_NLTK_RESOURCES_READY = False
+
+
+def _get_nltk_cache_dir() -> Path:
+    return Path.home() / ".cache" / "epub-media-overlay" / "nltk_data"
+
+
+def _ensure_nltk_search_path(cache_dir: Path) -> None:
+    cache_dir_str = str(cache_dir)
+    if cache_dir_str not in nltk.data.path:
+        nltk.data.path.insert(0, cache_dir_str)
+
+
+def _missing_nltk_resources() -> list[str]:
     missing = []
     for resource in ("tokenizers/punkt", "tokenizers/punkt_tab"):
         try:
             nltk.data.find(resource)
         except LookupError:
             missing.append(resource.rsplit("/", 1)[-1])
+    return missing
+
+
+def ensure_nltk_resources(logger: logging.Logger | None = None) -> None:
+    global _NLTK_RESOURCES_READY
+    if _NLTK_RESOURCES_READY:
+        return
+
+    cache_dir = _get_nltk_cache_dir()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    _ensure_nltk_search_path(cache_dir)
+
+    missing = _missing_nltk_resources()
 
     if missing:
-        missing_list = ", ".join(missing)
+        if logger:
+            logger.info(
+                "Downloading missing NLTK tokenizer data (%s) into %s",
+                ", ".join(missing),
+                cache_dir,
+            )
+        try:
+            for resource_name in missing:
+                nltk.download(
+                    resource_name,
+                    download_dir=str(cache_dir),
+                    quiet=True,
+                    raise_on_error=True,
+                )
+        except Exception as exc:
+            raise RuntimeError(
+                "Unable to download required NLTK tokenizer data "
+                f"({', '.join(missing)}) into {cache_dir}: {exc}"
+            ) from exc
+
+        missing = _missing_nltk_resources()
+
+    if missing:
         raise RuntimeError(
-            "Missing NLTK tokenizer data: "
-            f"{missing_list}. Install it once with: "
-            "python -m nltk.downloader punkt punkt_tab"
+            "Missing NLTK tokenizer data after automatic download attempt: "
+            f"{', '.join(missing)}"
         )
+
+    _NLTK_RESOURCES_READY = True
 
 # 1. CONSTANTS
 VOID_TAGS = {

@@ -26,11 +26,7 @@ Install Python dependencies:
 python -m pip install -r requirements.txt
 ```
 
-Install NLTK tokenizer data once:
-
-```bash
-python -m nltk.downloader punkt punkt_tab
-```
+The pipeline downloads the required NLTK tokenizer data automatically on first run and caches it under `~/.cache/epub-media-overlay/nltk_data`.
 
 ## Files
 
@@ -107,10 +103,6 @@ Important working artifacts:
 
 If `ffmpeg` or `ffprobe` are missing, install them and ensure they are on `PATH`.
 
-If NLTK data is missing, run:
-
-```bash
-python -m nltk.downloader punkt punkt_tab
-```
+If the first run cannot download NLTK data automatically, make sure the machine has network access and write permission for `~/.cache/epub-media-overlay/nltk_data`.
 
 If a run is interrupted, rerun the same command and the pipeline resumes automatically.

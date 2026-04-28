@@ -285,7 +285,7 @@ def load_pipeline_module():
         ) from exc
 
 
-def preflight(config: PipelineConfig) -> None:
+def preflight(config: PipelineConfig, logger: logging.Logger) -> None:
     if not config.m4b.exists():
         raise FileNotFoundError(f"Input M4B not found: {config.m4b}")
     if not config.epub.exists():
@@ -304,7 +304,7 @@ def preflight(config: PipelineConfig) -> None:
                 f"Missing Python dependency: {module_name}. Install the pipeline requirements before running."
             ) from exc
 
-    ensure_nltk_resources()
+    ensure_nltk_resources(logger)
 
 
 def initialize_state(config: PipelineConfig, paths: RuntimePaths) -> tuple[dict[str, Any], str]:
@@ -731,7 +731,7 @@ def execute_stage(
 def run_pipeline(config: PipelineConfig) -> int:
     paths = build_paths(config)
     logger = configure_logging(paths)
-    preflight(config)
+    preflight(config, logger)
     state, mode = initialize_state(config, paths)
     log_run_header(logger, config, paths, mode)
     started_at = time.monotonic()
