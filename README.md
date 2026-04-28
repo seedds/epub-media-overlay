@@ -28,12 +28,6 @@ python -m pip install -r requirements.txt
 
 The pipeline downloads the required NLTK tokenizer data automatically on first run and caches it under `~/.cache/epub-media-overlay/nltk_data`.
 
-## Files
-
-- `generate_epub_overlay.py`: CLI wrapper and state manager with automatic resume
-- `pipeline_core.py`: EPUB/audio matching, SMIL generation, packaging, and validation logic
-- `mark_sentence.py`: HTML segmentation logic used for overlay targets
-
 ## Usage
 
 Basic run:
@@ -60,19 +54,6 @@ python generate_epub_overlay.py \
   --fresh
 ```
 
-## Stages
-
-- `prepare`
-- `split`
-- `transcribe`
-- `match`
-- `segment`
-- `smil`
-- `package`
-- `validate`
-
-These stage names are shown in the log output so users can follow progress, but they are not part of the normal CLI workflow.
-
 ## Outputs
 
 Final output:
@@ -98,6 +79,12 @@ Important working artifacts:
 - The pipeline expects chapter metadata in the input `.m4b` for chunk generation.
 - Validation checks packaging, SMIL clip quality, transcript coverage, and OPF media-overlay wiring.
 - The console output and `logs/pipeline.log` include detailed stage-by-stage progress and timings.
+
+## Files
+
+- `generate_epub_overlay.py`: CLI wrapper and state manager with automatic resume
+- `pipeline_core.py`: EPUB/audio matching, SMIL generation, packaging, and validation logic
+- `mark_sentence.py`: HTML segmentation logic used for overlay targets
 
 ## Troubleshooting
 
