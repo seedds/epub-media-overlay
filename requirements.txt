@@ -1,0 +1,5 @@
+beautifulsoup4
+lxml
+nltk
+tqdm
+git+https://github.com/seedds/mlx-whisperx.git
