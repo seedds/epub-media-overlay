@@ -402,40 +402,53 @@ def split_m4b(book_info):
         text=True,
     )
     chapters_json = json.loads(output)["chapters"]
+    valid_chapters = [
+        chapter_info
+        for chapter_info in chapters_json
+        if float(chapter_info["end_time"]) > float(chapter_info["start_time"])
+    ]
 
-    for chapter_info in chapters_json:
+    for chapter_info in tqdm(valid_chapters, desc="Splitting audio", unit="chunk"):
         start_time = chapter_info["start_time"]
         end_time = chapter_info["end_time"]
         out_name = f"{str(chapter_info['id']).zfill(3)}" + book_info["audio_extension"]
-        if not os.path.exists(out_name):
-            if float(end_time) > float(start_time):
-                print(out_name)
-                # output = subprocess.check_output(f'ffmpeg -y -i "{m4b_file}" -ss {start_time} -to {end_time} -c:a libfdk_aac -b:a 64k -ac 1 "{os.path.join(folder_name, out_name)}"', shell=True)
-                subprocess.run(
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-i",
-                        book_info["m4b_file"],
-                        "-ss",
-                        start_time,
-                        "-to",
-                        end_time,
-                        "-vn",
-                        "-c:a",
-                        "aac",
-                        "-b:a",
-                        "64k",
-                        "-ar",
-                        "24000",
-                        "-ac",
-                        "1",
-                        os.path.join(book_info["folder_name"], out_name),
-                    ],
-                    check=True,
-                )
-            else:
-                print(f"Skipping {out_name}")
+        if os.path.exists(out_name):
+            continue
+
+        # Keep the console focused on overall progress. If ffmpeg fails, surface only
+        # its error output for the chunk that failed.
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-nostats",
+                "-i",
+                book_info["m4b_file"],
+                "-ss",
+                start_time,
+                "-to",
+                end_time,
+                "-vn",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "64k",
+                "-ar",
+                "24000",
+                "-ac",
+                "1",
+                os.path.join(book_info["folder_name"], out_name),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            error_output = (result.stderr or result.stdout or "Unknown ffmpeg error").strip()
+            raise RuntimeError(f"ffmpeg failed while creating {out_name}: {error_output}")
 
 
 def transcribe_audio(book_info):
