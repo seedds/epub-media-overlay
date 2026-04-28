@@ -747,6 +747,7 @@ def mark_segments(book_info):
     # that HTML file, so we process each HTML file at most once here.
     matched_items = normalize_matched_list(book_info["matched_list"])
     replacements = {}
+    language = book_info.get("language") or "en"
     css_zip_path = (
         f"{book_info['opf_dir']}/readaloud.css"
         if book_info["opf_dir"] != "."
@@ -765,7 +766,9 @@ def mark_segments(book_info):
                 html_content = html_file.read()
 
             processed_html = mark_sentences(
-                html_content, make_segment_prefix(html_file_name)
+                html_content,
+                make_segment_prefix(html_file_name),
+                language=language,
             )
             soup = BeautifulSoup(processed_html, "lxml")
             head = soup.head

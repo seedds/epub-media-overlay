@@ -162,6 +162,26 @@ from typing import List, Tuple, Union
 
 
 _NLTK_RESOURCES_READY = False
+_PUNKT_LANGUAGE_MAP = {
+    "cs": "czech",
+    "da": "danish",
+    "de": "german",
+    "el": "greek",
+    "en": "english",
+    "es": "spanish",
+    "et": "estonian",
+    "fi": "finnish",
+    "fr": "french",
+    "it": "italian",
+    "nl": "dutch",
+    "no": "norwegian",
+    "pl": "polish",
+    "pt": "portuguese",
+    "ru": "russian",
+    "sl": "slovene",
+    "sv": "swedish",
+    "tr": "turkish",
+}
 
 
 def _get_nltk_cache_dir() -> Path:
@@ -182,6 +202,18 @@ def _missing_nltk_resources() -> list[str]:
         except LookupError:
             missing.append(resource.rsplit("/", 1)[-1])
     return missing
+
+
+def normalize_punkt_language(language: str | None) -> str:
+    if not language:
+        return "english"
+
+    normalized = language.strip().lower().replace("_", "-")
+    if normalized in _PUNKT_LANGUAGE_MAP:
+        return _PUNKT_LANGUAGE_MAP[normalized]
+
+    base_language = normalized.split("-", 1)[0]
+    return _PUNKT_LANGUAGE_MAP.get(base_language, base_language)
 
 
 def ensure_nltk_resources(logger: logging.Logger | None = None) -> None:
@@ -589,6 +621,7 @@ def _get_sentence_boundaries(text: str, language: str) -> List[Tuple[int, int]]:
     """Get sentence boundaries using Cached Tokenizer."""
     # Punkt provides the initial sentence candidates. Later logic refines them.
     ensure_nltk_resources()
+    language = normalize_punkt_language(language)
     normalized_text = (
         text.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
     )

@@ -43,6 +43,8 @@ Transcription defaults:
 - model: `mlx-community/whisper-turbo`
 - language: `en`
 
+The `--language` setting is used for both transcription and HTML sentence segmentation.
+
 Override them when needed:
 
 ```bash

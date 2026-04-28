@@ -385,7 +385,6 @@ def build_book_info(state: dict[str, Any], paths: RuntimePaths, matched_list: li
     if not book_info:
         raise RuntimeError("Working book metadata is missing. Run the prepare stage first.")
     book_info["folder_name"] = str(paths.run_dir)
-    book_info["model"] = None
     if matched_list is not None:
         book_info["matched_list"] = matched_list
     return book_info
@@ -395,7 +394,8 @@ def refresh_working_epub(legacy: Any, book_info: dict[str, Any], run_dir: Path) 
     refreshed = {
         "folder_name": str(run_dir),
         "audio_extension": book_info["audio_extension"],
-        "model": None,
+        "model": book_info.get("model"),
+        "language": book_info.get("language", "en"),
     }
     with pushd(run_dir):
         m4b_file, _source_epub, out_file, root_level = legacy.preprocess(refreshed)
@@ -515,7 +515,8 @@ def run_prepare_stage(
     book_info = {
         "folder_name": str(paths.run_dir),
         "audio_extension": config.audio_extension,
-        "model": None,
+        "model": config.model,
+        "language": config.language,
     }
     with pushd(paths.run_dir):
         m4b_file, _epub_file, out_file, root_level = legacy.preprocess(book_info)
