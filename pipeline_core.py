@@ -140,6 +140,7 @@ High-risk areas
 
 import difflib
 import glob
+import io
 import json
 import os
 import posixpath
@@ -150,6 +151,7 @@ import warnings
 import xml.dom.minidom as minidom
 import zipfile
 from collections import Counter, defaultdict
+from contextlib import redirect_stderr, redirect_stdout
 from html import escape
 from pathlib import Path
 
@@ -451,6 +453,12 @@ def split_m4b(book_info):
             raise RuntimeError(f"ffmpeg failed while creating {out_name}: {error_output}")
 
 
+def print_nonzero_summary(label, counters):
+    parts = [f"{value} {name}" for name, value in counters if value]
+    if parts:
+        print(f"{label}: " + ", ".join(parts))
+
+
 def transcribe_audio(book_info):
     # Transcription is per split audio chunk, not against the original `.m4b`. The
     # sibling JSON files become the canonical transcript inputs for both matching and
@@ -459,17 +467,35 @@ def transcribe_audio(book_info):
     model = book_info.get("model") or default_model_for_backend(backend)
     language = book_info.get("language") or "en"
 
-    for file in sorted(glob.glob(f"*{book_info['audio_extension']}")):
-        if not os.path.exists(file.replace(book_info["audio_extension"], ".json")):
-            print("✅ " + file)
-            result = transcribe_file(
-                file,
-                model,
-                language,
-                backend,
-            )
-            with open(file.replace(book_info["audio_extension"], ".json"), 'w', encoding="utf-8") as f:
-                json.dump(result, f, ensure_ascii=False)
+    for file in tqdm(
+        sorted(glob.glob(f"*{book_info['audio_extension']}")),
+        desc="Transcribing audio",
+        unit="chunk",
+    ):
+        json_file = file.replace(book_info["audio_extension"], ".json")
+        if os.path.exists(json_file):
+            continue
+
+        stdout_buffer = io.StringIO()
+        stderr_buffer = io.StringIO()
+        try:
+            with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
+                result = transcribe_file(
+                    file,
+                    model,
+                    language,
+                    backend,
+                )
+        except Exception as exc:
+            error_output = (stderr_buffer.getvalue() or stdout_buffer.getvalue()).strip()
+            if error_output:
+                raise RuntimeError(
+                    f"transcription failed for {file}: {error_output}"
+                ) from exc
+            raise RuntimeError(f"transcription failed for {file}: {exc}") from exc
+
+        with open(json_file, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False)
             
 
 
@@ -478,7 +504,6 @@ def transcribe_audio(book_info):
 
 
 def link_html_with_audio(book_info):
-    model = book_info.get("model")
     epub_path = book_info.get("epub_file")
 
     if not epub_path:
@@ -487,12 +512,6 @@ def link_html_with_audio(book_info):
     if not os.path.exists(epub_path):
         print(f"ERROR: EPUB file not found at path: {epub_path}")
         return []
-
-    print(f"Starting linking process for EPUB: {epub_path}")
-    if model:
-        print(f"Transcription model recorded for this run: {model}")
-    else:
-        print("Model not provided. Using lexical window matching.")
 
     # Matching model:
     # build overlapping token windows inside each HTML file, then score transcript
@@ -505,11 +524,15 @@ def link_html_with_audio(book_info):
     overlap_threshold = 6
     combined_score_threshold = 0.35
     top_k_windows = 24
+    preprocess_stats = {
+        "decode_fallbacks": 0,
+        "html_skipped_short": 0,
+        "html_errors": 0,
+    }
 
     # Step 1: build a candidate window index over EPUB text.
     # Candidate records carry file identity, token offsets, lexical counters, and a
     # global reading-order index used for a soft forward-bias.
-    print("--- Step 1: Pre-processing EPUB HTML files ---")
     try:
         with zipfile.ZipFile(epub_path, "r") as zf:
             html_files = get_spine_ordered_html_files(zf)
@@ -520,16 +543,16 @@ def link_html_with_audio(book_info):
                 )
                 return []
 
-            for html_order, file_name in enumerate(html_files):
+            for html_order, file_name in enumerate(
+                tqdm(html_files, desc="Indexing EPUB", unit="file")
+            ):
                 try:
                     with zf.open(file_name) as f:
                         try:
                             raw_html = f.read()
                             html_content = raw_html.decode("utf-8")
                         except UnicodeDecodeError:
-                            print(
-                                f"❌ UTF-8 decode failed for {file_name}. Trying latin-1."
-                            )
+                            preprocess_stats["decode_fallbacks"] += 1
                             html_content = raw_html.decode("latin-1", errors="replace")
 
                         soup = BeautifulSoup(html_content, "lxml")
@@ -544,9 +567,7 @@ def link_html_with_audio(book_info):
                         )
 
                         if len(token_items) < 5:
-                            print(
-                                f"Skipping {file_name} due to insufficient/empty text after extraction."
-                            )
+                            preprocess_stats["html_skipped_short"] += 1
                             continue
 
                         max_start = max(0, len(token_items) - window_size)
@@ -597,12 +618,8 @@ def link_html_with_audio(book_info):
                                 }
                             )
 
-                        print(
-                            f"  Processed HTML {html_order + 1}/{len(html_files)}: {file_name} (Tokens: {len(token_items)}, Windows: {len(window_ranges)})"
-                        )
-
-                except Exception as e:
-                    print(f"ERROR processing HTML file {file_name} from EPUB: {e}")
+                except Exception:
+                    preprocess_stats["html_errors"] += 1
                     continue  # Continue to next HTML file
 
     except zipfile.BadZipFile:
@@ -618,15 +635,31 @@ def link_html_with_audio(book_info):
         )
         return []
 
-    print(f"Prepared {len(epub_candidates)} candidate windows.")
+    print_nonzero_summary(
+        "Indexing summary",
+        [
+            ("decode fallback(s)", preprocess_stats["decode_fallbacks"]),
+            ("short/empty HTML file(s) skipped", preprocess_stats["html_skipped_short"]),
+            ("HTML file(s) failed", preprocess_stats["html_errors"]),
+        ],
+    )
 
     # Step 2: score each transcript against the candidate windows.
     # Current policy prefers lexical overlap plus local token-order agreement over
     # embedding-only matching because short openings and chapter headers are noisy.
-    print("\n--- Step 2: Matching JSON files to EPUB HTML ---")
     matched_list = []
     json_files = sorted(glob.glob("*.json"))
     last_global_index = 0
+    match_stats = {
+        "json_skipped_short": 0,
+        "json_skipped_probe": 0,
+        "no_overlap": 0,
+        "no_candidate": 0,
+        "below_threshold": 0,
+        "backward_warnings": 0,
+        "decode_errors": 0,
+        "processing_errors": 0,
+    }
 
     if not json_files:
         print(
@@ -634,16 +667,13 @@ def link_html_with_audio(book_info):
         )
         return []
 
-    for i, json_file in enumerate(json_files):
-        print(f"  Processing JSON {i + 1}/{len(json_files)}: {json_file}")
+    for json_file in tqdm(json_files, desc="Matching transcripts", unit="file"):
         try:
             audio_tokens = load_audio_tokens(json_file)
             content_words = [item["word"] for item in audio_tokens]
 
             if not content_words or len(content_words) < 5:
-                print(
-                    f"  WARNING: Skipping {json_file} due to insufficient/empty text content."
-                )
+                match_stats["json_skipped_short"] += 1
                 continue
 
             # Only the transcript opening is used as the probe text. That is usually
@@ -653,7 +683,7 @@ def link_html_with_audio(book_info):
                 token for token in probe_tokens if len(token) >= overlap_token_min_length
             ]
             if not probe_match_tokens:
-                print(f"  WARNING: Skipping {json_file} due to missing clean probe tokens.")
+                match_stats["json_skipped_probe"] += 1
                 continue
             probe_counter = Counter(probe_match_tokens)
 
@@ -669,7 +699,7 @@ def link_html_with_audio(book_info):
                     overlap_scored_candidates.append((overlap_count, candidate))
 
             if not overlap_scored_candidates:
-                print(f"  WARNING: No lexical overlap found for {json_file}.")
+                match_stats["no_overlap"] += 1
                 continue
 
             overlap_scored_candidates.sort(
@@ -696,20 +726,14 @@ def link_html_with_audio(book_info):
                     best_match = candidate
 
             if best_match is None:
-                print(f"  WARNING: No candidate window survived scoring for {json_file}.")
+                match_stats["no_candidate"] += 1
                 continue
-
-            best_match_file = best_match["file_name"]
-
-            print(
-                f"    -> Best match for {json_file}: {best_match_file} [{best_match['window_start']}:{best_match['window_end']}] (Score: {best_score:.4f}, Overlap: {best_overlap})"
-            )
 
             if best_score >= combined_score_threshold and best_overlap >= overlap_threshold:
                 matched_list.append(
                     {
                         "json_file": json_file,
-                        "html_file": best_match_file,
+                        "html_file": best_match["file_name"],
                         "score": float(best_score),
                         "html_order": best_match["html_order"],
                         "window_index": best_match["window_index"],
@@ -720,9 +744,7 @@ def link_html_with_audio(book_info):
                 )
                 last_global_index = best_match["global_index"]
             else:
-                print(
-                    f"❌ Match score {best_score:.4f} / overlap {best_overlap} for {json_file} is below threshold. Skipping this match."
-                )
+                match_stats["below_threshold"] += 1
                 continue
 
             # Diagnostic only: log suspicious backward jumps after accepting a match.
@@ -735,24 +757,27 @@ def link_html_with_audio(book_info):
                         and "preface" not in prev_html_file.lower()
                         and "intro" not in prev_html_file.lower()
                     ):
-                        print(
-                            f"  [Order Warning] Current HTML file '{curr_html_file}' came before previous '{prev_html_file}' in sorted list."
-                        )
+                        match_stats["backward_warnings"] += 1
 
         except json.JSONDecodeError:
-            print(f"❌ Could not decode JSON from file: {json_file}")
-        except Exception as e:
-            print(f"❌ error processing JSON file {json_file}: {e}")
+            match_stats["decode_errors"] += 1
+        except Exception:
+            match_stats["processing_errors"] += 1
 
-    print("\n--- Matching Complete ---")
-    if matched_list:
-        print("Successfully matched items:")
-        for item in matched_list:
-            print(
-                f"  JSON: {item['json_file']}, HTML: {item['html_file']}, Window: {item['window_start']}:{item['window_end']}, Score: {item['score']:.4f}"
-            )
-    else:
-        print("No matches found based on the given criteria.")
+    print_nonzero_summary(
+        "Matching summary",
+        [
+            ("matched transcript(s)", len(matched_list)),
+            ("low-content transcript(s) skipped", match_stats["json_skipped_short"]),
+            ("transcript(s) skipped for missing probe tokens", match_stats["json_skipped_probe"]),
+            ("transcript(s) with no lexical overlap", match_stats["no_overlap"]),
+            ("transcript(s) with no surviving candidate", match_stats["no_candidate"]),
+            ("transcript(s) below threshold", match_stats["below_threshold"]),
+            ("backward-order warning(s)", match_stats["backward_warnings"]),
+            ("JSON decode error(s)", match_stats["decode_errors"]),
+            ("transcript processing error(s)", match_stats["processing_errors"]),
+        ],
+    )
 
     return matched_list
 
@@ -1916,14 +1941,19 @@ def create_smil_files(book_info, skip=True):
     matched_items = normalize_matched_list(book_info["matched_list"])
     if not skip:
         for file in glob.glob("*.smil"):
-            print(f"Removing old smil: {file}")
             os.remove(file)
 
     html_groups = {}
     for item in matched_items:
         html_groups.setdefault(item["html_file"], []).append(item)
 
-    for html_file, items in tqdm(html_groups.items(), desc="Aligning Chapters"):
+    alignment_stats = {
+        "no_audio_tokens": 0,
+        "no_alignment": 0,
+        "no_segments": 0,
+    }
+
+    for html_file, items in tqdm(html_groups.items(), desc="Generating SMIL", unit="file"):
         smil_filename = make_overlay_basename(html_file)
 
         if os.path.exists(smil_filename) and skip:
@@ -1938,7 +1968,7 @@ def create_smil_files(book_info, skip=True):
             json_file = item["json_file"]
             audio_tokens = load_audio_tokens(json_file)
             if not audio_tokens:
-                print(f"No alignable words found in {json_file}, skipping.")
+                alignment_stats["no_audio_tokens"] += 1
                 continue
 
             audio_filename = json_file.replace(".json", book_info["audio_extension"])
@@ -1993,7 +2023,7 @@ def create_smil_files(book_info, skip=True):
                     break
 
             if not best_match or best_match["matched_token_count"] == 0:
-                print(f"No alignment found for {json_file} -> {html_file}")
+                alignment_stats["no_alignment"] += 1
                 continue
 
             matched_ordered_list = finalize_segment_timestamps(
@@ -2006,7 +2036,7 @@ def create_smil_files(book_info, skip=True):
             )
 
             if not matched_ordered_list:
-                print(f"No matched segments found for {json_file} -> {html_file}")
+                alignment_stats["no_segments"] += 1
                 continue
 
             for segment_match in matched_ordered_list:
@@ -2077,6 +2107,15 @@ def create_smil_files(book_info, skip=True):
         # Write SMIL
         with open(smil_filename, "w", encoding="utf-8") as f:
             f.write(convert_soup_to_html(soup_smil))
+
+    print_nonzero_summary(
+        "SMIL summary",
+        [
+            ("transcript(s) with no alignable words", alignment_stats["no_audio_tokens"]),
+            ("transcript(s) with no alignment", alignment_stats["no_alignment"]),
+            ("transcript(s) with no matched segments", alignment_stats["no_segments"]),
+        ],
+    )
 
 
 # === Packaging and OPF updates ===
