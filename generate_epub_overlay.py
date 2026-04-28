@@ -2,8 +2,8 @@
 """Resumable EPUB media-overlay generation pipeline.
 
 This script wraps the local pipeline and `mark_sentence.py` workflow in a
-production-oriented CLI with explicit inputs, persistent state, and safe resume
-behavior after interruption.
+production-oriented CLI with explicit inputs, persistent state, and automatic
+resume behavior after interruption.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import traceback
 import zipfile
 from contextlib import contextmanager
@@ -48,14 +49,10 @@ class PipelineConfig:
     output_dir: Path
     output_path: Path
     work_dir: Path
-    resume: bool
     fresh: bool
     model: str
     language: str
     audio_extension: str
-    from_stage: str | None
-    force_stages: tuple[str, ...]
-    validate_only: bool
 
 
 @dataclass(frozen=True)
@@ -165,112 +162,6 @@ def set_stage_state(
     record.update(extra)
 
 
-def mark_pending_from(state: dict[str, Any], stage: str) -> None:
-    start_index = STAGES.index(stage)
-    for name in STAGES[start_index:]:
-        set_stage_state(state, name, "pending")
-
-
-def remove_matching(run_dir: Path, *patterns: str) -> None:
-    for pattern in patterns:
-        for path in run_dir.glob(pattern):
-            delete_path(path)
-
-
-def cleanup_from_stage(paths: RuntimePaths, stage: str, audio_extension: str) -> None:
-    if stage == "prepare":
-        if paths.run_dir.exists():
-            shutil.rmtree(paths.run_dir)
-        for cleanup_path in (
-            paths.matched_list_path,
-            paths.segmented_snapshot_path,
-            paths.packaged_epub_path,
-            paths.validation_path,
-            paths.output_path,
-        ):
-            delete_path(cleanup_path)
-        return
-
-    paths.logs_dir.mkdir(parents=True, exist_ok=True)
-    paths.run_dir.mkdir(parents=True, exist_ok=True)
-
-    if stage == "split":
-        remove_matching(
-            paths.run_dir,
-            f"*{audio_extension}",
-            "*.json",
-            "*.smil",
-            "*.parquet",
-            "*.epub3",
-        )
-        for cleanup_path in (
-            paths.matched_list_path,
-            paths.segmented_snapshot_path,
-            paths.packaged_epub_path,
-            paths.validation_path,
-            paths.output_path,
-        ):
-            delete_path(cleanup_path)
-        return
-
-    if stage == "transcribe":
-        remove_matching(paths.run_dir, "*.json", "*.smil", "*.parquet")
-        for cleanup_path in (
-            paths.matched_list_path,
-            paths.segmented_snapshot_path,
-            paths.packaged_epub_path,
-            paths.validation_path,
-            paths.output_path,
-        ):
-            delete_path(cleanup_path)
-        return
-
-    if stage == "match":
-        remove_matching(paths.run_dir, "*.smil", "*.parquet")
-        for cleanup_path in (
-            paths.matched_list_path,
-            paths.segmented_snapshot_path,
-            paths.packaged_epub_path,
-            paths.validation_path,
-            paths.output_path,
-        ):
-            delete_path(cleanup_path)
-        return
-
-    if stage == "segment":
-        remove_matching(paths.run_dir, "*.smil", "*.parquet")
-        for cleanup_path in (
-            paths.segmented_snapshot_path,
-            paths.packaged_epub_path,
-            paths.validation_path,
-            paths.output_path,
-        ):
-            delete_path(cleanup_path)
-        return
-
-    if stage == "smil":
-        remove_matching(paths.run_dir, "*.smil", "*.parquet")
-        for cleanup_path in (
-            paths.packaged_epub_path,
-            paths.validation_path,
-            paths.output_path,
-        ):
-            delete_path(cleanup_path)
-        return
-
-    if stage == "package":
-        for cleanup_path in (
-            paths.packaged_epub_path,
-            paths.validation_path,
-            paths.output_path,
-        ):
-            delete_path(cleanup_path)
-        return
-
-    if stage == "validate":
-        delete_path(paths.validation_path)
-
-
 def build_signature(config: PipelineConfig) -> dict[str, Any]:
     return {
         "m4b": fingerprint_file(config.m4b),
@@ -326,7 +217,7 @@ def parse_args() -> PipelineConfig:
     parser.add_argument("--output-dir", required=True, help="Directory for the final EPUB")
     parser.add_argument(
         "--work-dir",
-        help="Working directory used for resumable state and intermediate artifacts",
+        help="Working directory used for persistent state and intermediate artifacts",
     )
     parser.add_argument(
         "--model",
@@ -340,31 +231,9 @@ def parse_args() -> PipelineConfig:
         help="Audio chunk extension produced during splitting",
     )
     parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume an existing compatible working directory",
-    )
-    parser.add_argument(
         "--fresh",
         action="store_true",
-        help="Discard any existing working state and restart from scratch",
-    )
-    parser.add_argument(
-        "--from-stage",
-        choices=STAGES,
-        help="Start execution from this stage instead of the beginning",
-    )
-    parser.add_argument(
-        "--force-stage",
-        action="append",
-        default=[],
-        choices=STAGES,
-        help="Force a stage and all downstream stages to rerun",
-    )
-    parser.add_argument(
-        "--validate-only",
-        action="store_true",
-        help="Only run validation against the existing work/output state",
+        help="Discard any existing working state and restart from scratch instead of resuming automatically",
     )
     args = parser.parse_args()
 
@@ -384,14 +253,10 @@ def parse_args() -> PipelineConfig:
         output_dir=output_dir,
         output_path=output_path,
         work_dir=work_dir,
-        resume=args.resume,
         fresh=args.fresh,
         model=args.model,
         language=args.language,
         audio_extension=args.audio_extension,
-        from_stage=args.from_stage,
-        force_stages=tuple(args.force_stage),
-        validate_only=args.validate_only,
     )
 
 
@@ -442,34 +307,70 @@ def preflight(config: PipelineConfig) -> None:
     ensure_nltk_resources()
 
 
-def initialize_state(config: PipelineConfig, paths: RuntimePaths) -> dict[str, Any]:
+def initialize_state(config: PipelineConfig, paths: RuntimePaths) -> tuple[dict[str, Any], str]:
     signature = build_signature(config)
     existing_state = load_state(paths.state_path)
+    mode = "new"
 
     if config.fresh and paths.root.exists():
         shutil.rmtree(paths.root)
         existing_state = None
+        mode = "fresh_restart"
 
     if existing_state:
         if existing_state.get("signature") != signature:
             shutil.rmtree(paths.root, ignore_errors=True)
             existing_state = None
-        elif (
-            not config.resume
-            and not config.validate_only
-            and not config.force_stages
-            and not config.from_stage
-        ):
-            raise RuntimeError(
-                f"Existing work state found at {paths.root}. Use --resume to continue or --fresh to restart."
-            )
+            mode = "signature_reset"
+        else:
+            mode = "resume"
+    elif config.fresh:
+        mode = "fresh_restart"
 
     paths.root.mkdir(parents=True, exist_ok=True)
     paths.logs_dir.mkdir(parents=True, exist_ok=True)
 
     state = existing_state or default_state(signature, config, paths)
     save_state(paths, state)
-    return state
+    return state, mode
+
+
+def describe_run_mode(mode: str) -> str:
+    if mode == "resume":
+        return "automatic resume from existing compatible work state"
+    if mode == "fresh_restart":
+        return "fresh restart requested with --fresh"
+    if mode == "signature_reset":
+        return "fresh restart because the saved work state does not match the current inputs"
+    return "new run"
+
+
+def log_run_header(
+    logger: logging.Logger,
+    config: PipelineConfig,
+    paths: RuntimePaths,
+    mode: str,
+) -> None:
+    logger.info("Starting EPUB media-overlay pipeline")
+    logger.info("Run mode: %s", describe_run_mode(mode))
+    logger.info("Input M4B: %s", config.m4b)
+    logger.info("Input EPUB: %s", config.epub)
+    logger.info("Output EPUB: %s", config.output_path)
+    logger.info("Work dir: %s", paths.root)
+    logger.info("Detailed log: %s", paths.logs_dir / "pipeline.log")
+
+
+def log_run_summary(
+    logger: logging.Logger,
+    config: PipelineConfig,
+    paths: RuntimePaths,
+    started_at: float,
+    validation_ok: bool,
+) -> None:
+    logger.info("Run completed in %.1fs", time.monotonic() - started_at)
+    logger.info("Final EPUB: %s", config.output_path)
+    logger.info("Validation result: %s", "passed" if validation_ok else "failed")
+    logger.info("Detailed log: %s", paths.logs_dir / "pipeline.log")
 
 
 def build_book_info(state: dict[str, Any], paths: RuntimePaths, matched_list: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -829,37 +730,28 @@ def execute_stage(
 
 def run_pipeline(config: PipelineConfig) -> int:
     paths = build_paths(config)
-    preflight(config)
-    state = initialize_state(config, paths)
     logger = configure_logging(paths)
+    preflight(config)
+    state, mode = initialize_state(config, paths)
+    log_run_header(logger, config, paths, mode)
+    started_at = time.monotonic()
 
     legacy = load_pipeline_module()
 
-    for forced_stage in config.force_stages:
-        logger.info("Forcing stage %s and downstream stages to rerun", forced_stage)
-        cleanup_from_stage(paths, forced_stage, config.audio_extension)
-        mark_pending_from(state, forced_stage)
-        save_state(paths, state)
-
-    if config.validate_only:
-        start_index = STAGES.index("validate")
-    elif config.from_stage:
-        start_index = STAGES.index(config.from_stage)
-    else:
-        start_index = 0
-
-    for stage in STAGES[start_index:]:
-        if not config.validate_only and stage_status(state, stage) == "success":
-            logger.info("Skipping %s stage because it already completed successfully", stage)
+    for index, stage in enumerate(STAGES, start=1):
+        if stage_status(state, stage) == "success":
+            logger.info("[%d/%d] Skipping %s (already completed)", index, len(STAGES), stage)
             continue
 
-        logger.info("Starting %s stage", stage)
+        logger.info("[%d/%d] Starting %s", index, len(STAGES), stage)
         set_stage_state(state, stage, "running")
         save_state(paths, state)
+        stage_started_at = time.monotonic()
 
         try:
             result = execute_stage(stage, config, paths, state, legacy, logger)
         except Exception as exc:
+            elapsed = time.monotonic() - stage_started_at
             set_stage_state(
                 state,
                 stage,
@@ -868,16 +760,28 @@ def run_pipeline(config: PipelineConfig) -> int:
                 traceback=traceback.format_exc(),
             )
             save_state(paths, state)
-            logger.exception("Stage %s failed", stage)
+            logger.exception("[%d/%d] %s failed after %.1fs", index, len(STAGES), stage, elapsed)
+            logger.info("Detailed log: %s", paths.logs_dir / "pipeline.log")
             return 1
 
         set_stage_state(state, stage, "success", result=result)
         save_state(paths, state)
+        logger.info(
+            "[%d/%d] Completed %s in %.1fs",
+            index,
+            len(STAGES),
+            stage,
+            time.monotonic() - stage_started_at,
+        )
 
     validation_status = stage_status(state, "validate")
     if validation_status == "success":
         validation_result = state["stages"]["validate"]["result"]
-        return 0 if validation_result.get("ok", False) else 1
+        validation_ok = validation_result.get("ok", False)
+        log_run_summary(logger, config, paths, started_at, validation_ok)
+        return 0 if validation_ok else 1
+
+    log_run_summary(logger, config, paths, started_at, True)
     return 0
 
 

@@ -2,7 +2,7 @@
 
 Generate a Media Overlay EPUB from an audiobook `.m4b` file and a source `.epub`.
 
-This project provides a resumable command-line pipeline that:
+This project provides a command-line pipeline that automatically resumes prior work when possible and:
 
 - prepares a working EPUB copy
 - splits audiobook chapters into audio chunks
@@ -34,7 +34,7 @@ python -m nltk.downloader punkt punkt_tab
 
 ## Files
 
-- `generate_epub_overlay.py`: resumable CLI wrapper and stage/state manager
+- `generate_epub_overlay.py`: CLI wrapper and state manager with automatic resume
 - `pipeline_core.py`: EPUB/audio matching, SMIL generation, packaging, and validation logic
 - `mark_sentence.py`: HTML segmentation logic used for overlay targets
 
@@ -49,15 +49,11 @@ python generate_epub_overlay.py \
   --output-dir /path/to/output
 ```
 
-Resume a previous run:
+Run behavior:
 
-```bash
-python generate_epub_overlay.py \
-  --m4b /path/to/book.m4b \
-  --epub /path/to/book.epub \
-  --output-dir /path/to/output \
-  --resume
-```
+- if compatible work already exists, the pipeline resumes automatically
+- if no work exists yet, the pipeline starts from the beginning
+- use `--fresh` only when you want to discard previous work and restart from scratch
 
 Restart from scratch:
 
@@ -67,39 +63,6 @@ python generate_epub_overlay.py \
   --epub /path/to/book.epub \
   --output-dir /path/to/output \
   --fresh
-```
-
-Rerun from a specific stage:
-
-```bash
-python generate_epub_overlay.py \
-  --m4b /path/to/book.m4b \
-  --epub /path/to/book.epub \
-  --output-dir /path/to/output \
-  --resume \
-  --from-stage segment
-```
-
-Force a stage and everything after it to rerun:
-
-```bash
-python generate_epub_overlay.py \
-  --m4b /path/to/book.m4b \
-  --epub /path/to/book.epub \
-  --output-dir /path/to/output \
-  --resume \
-  --force-stage smil
-```
-
-Validate only:
-
-```bash
-python generate_epub_overlay.py \
-  --m4b /path/to/book.m4b \
-  --epub /path/to/book.epub \
-  --output-dir /path/to/output \
-  --resume \
-  --validate-only
 ```
 
 ## Stages
@@ -112,6 +75,8 @@ python generate_epub_overlay.py \
 - `smil`
 - `package`
 - `validate`
+
+These stage names are shown in the log output so users can follow progress, but they are not part of the normal CLI workflow.
 
 ## Outputs
 
@@ -136,6 +101,7 @@ Important working artifacts:
 - The source `.epub` is not modified directly.
 - The pipeline expects chapter metadata in the input `.m4b` for chunk generation.
 - Validation checks packaging, SMIL clip quality, transcript coverage, and OPF media-overlay wiring.
+- The console output and `logs/pipeline.log` include detailed stage-by-stage progress and timings.
 
 ## Troubleshooting
 
@@ -147,4 +113,4 @@ If NLTK data is missing, run:
 python -m nltk.downloader punkt punkt_tab
 ```
 
-If a run is interrupted, restart with `--resume`.
+If a run is interrupted, rerun the same command and the pipeline resumes automatically.
