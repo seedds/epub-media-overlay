@@ -6,7 +6,7 @@ This project provides a command-line pipeline that automatically resumes prior w
 
 - prepares a working EPUB copy
 - splits audiobook chapters into audio chunks
-- transcribes each chunk with `mlx-whisperx`
+- transcribes each chunk with a platform-appropriate backend
 - matches transcript chunks to EPUB HTML files
 - injects stable segment ids into HTML
 - generates SMIL overlays
@@ -18,7 +18,11 @@ This project provides a command-line pipeline that automatically resumes prior w
 - Python 3
 - `ffmpeg`
 - `ffprobe`
-- Apple Silicon environment suitable for `mlx-whisperx`
+
+Transcription backend by platform:
+
+- Apple Silicon macOS: `mlx-whisperx`
+- other platforms: `whisperx`
 
 Install Python dependencies:
 
@@ -40,7 +44,8 @@ python generate_epub_overlay.py \
 
 Transcription defaults:
 
-- model: `mlx-community/whisper-turbo`
+- Apple Silicon macOS model: `mlx-community/whisper-turbo`
+- other platforms model: `small`
 - language: `en`
 
 The `--language` setting is used for both transcription and HTML sentence segmentation.
@@ -51,9 +56,11 @@ Override them when needed:
 python generate_epub_overlay.py \
   --m4b /path/to/book.m4b \
   --epub /path/to/book.epub \
-  --model mlx-community/whisper-large-v3-turbo \
+  --model large-v2 \
   --language en
 ```
+
+Model names depend on the selected backend. For example, non-MLX platforms should use standard Whisper or WhisperX model names such as `small`, `medium`, `large`, or `large-v2`.
 
 Run behavior:
 
@@ -102,6 +109,7 @@ Important working artifacts:
 - `generate_epub_overlay.py`: CLI wrapper and state manager with automatic resume
 - `pipeline_core.py`: EPUB/audio matching, SMIL generation, packaging, and validation logic
 - `mark_sentence.py`: HTML segmentation logic used for overlay targets
+- `transcription_backend.py`: platform-aware transcription backend selection and adapters
 
 ## Troubleshooting
 

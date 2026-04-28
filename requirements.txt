@@ -2,4 +2,5 @@ beautifulsoup4
 lxml
 nltk
 tqdm
-git+https://github.com/seedds/mlx-whisperx.git
+whisperx ; platform_system != "Darwin" or platform_machine != "arm64"
+mlx-whisperx @ git+https://github.com/seedds/mlx-whisperx.git ; platform_system == "Darwin" and platform_machine == "arm64"

@@ -27,6 +27,11 @@ from pathlib import Path
 from typing import Any
 
 from mark_sentence import ensure_nltk_resources
+from transcription_backend import (
+    default_model_for_backend,
+    detect_transcription_backend,
+    required_module_for_backend,
+)
 
 STAGES = (
     "prepare",
@@ -50,6 +55,7 @@ class PipelineConfig:
     output_path: Path
     work_dir: Path
     fresh: bool
+    backend: str
     model: str
     language: str
     audio_extension: str
@@ -117,6 +123,7 @@ def default_state(signature: dict[str, Any], config: PipelineConfig, paths: Runt
             "epub": str(config.epub),
         },
         "config": {
+            "backend": config.backend,
             "model": config.model,
             "language": config.language,
             "audio_extension": config.audio_extension,
@@ -166,6 +173,7 @@ def build_signature(config: PipelineConfig) -> dict[str, Any]:
     return {
         "m4b": fingerprint_file(config.m4b),
         "epub": fingerprint_file(config.epub),
+        "backend": config.backend,
         "model": config.model,
         "language": config.language,
         "audio_extension": config.audio_extension,
@@ -224,8 +232,10 @@ def parse_args() -> PipelineConfig:
     )
     parser.add_argument(
         "--model",
-        default="mlx-community/whisper-turbo",
-        help="WhisperX model identifier",
+        help=(
+            "Transcription model identifier. Defaults to "
+            "mlx-community/whisper-turbo on Apple Silicon macOS and small elsewhere"
+        ),
     )
     parser.add_argument("--language", default="en", help="Transcription language code")
     parser.add_argument(
@@ -253,6 +263,8 @@ def parse_args() -> PipelineConfig:
         else output_dir / f".{epub.stem}.epubmo"
     )
     output_path = output_dir / f"{epub.stem}.media-overlay.epub"
+    backend = detect_transcription_backend()
+    model = args.model or default_model_for_backend(backend)
 
     return PipelineConfig(
         m4b=m4b,
@@ -261,7 +273,8 @@ def parse_args() -> PipelineConfig:
         output_path=output_path,
         work_dir=work_dir,
         fresh=args.fresh,
-        model=args.model,
+        backend=backend,
+        model=model,
         language=args.language,
         audio_extension=args.audio_extension,
     )
@@ -303,7 +316,7 @@ def preflight(config: PipelineConfig, logger: logging.Logger) -> None:
         raise ValueError(f"Expected an .epub input, got: {config.epub}")
     ensure_command("ffprobe")
     ensure_command("ffmpeg")
-    for module_name in ("bs4", "lxml", "tqdm", "mlx_whisperx"):
+    for module_name in ("bs4", "lxml", "tqdm", required_module_for_backend(config.backend)):
         try:
             importlib.import_module(module_name)
         except ModuleNotFoundError as exc:
@@ -362,6 +375,9 @@ def log_run_header(
     logger.info("Run mode: %s", describe_run_mode(mode))
     logger.info("Input M4B: %s", config.m4b)
     logger.info("Input EPUB: %s", config.epub)
+    logger.info("Transcription backend: %s", config.backend)
+    logger.info("Transcription model: %s", config.model)
+    logger.info("Transcription language: %s", config.language)
     logger.info("Output EPUB: %s", config.output_path)
     logger.info("Work dir: %s", paths.root)
     logger.info("Detailed log: %s", paths.logs_dir / "pipeline.log")
@@ -394,6 +410,7 @@ def refresh_working_epub(legacy: Any, book_info: dict[str, Any], run_dir: Path) 
     refreshed = {
         "folder_name": str(run_dir),
         "audio_extension": book_info["audio_extension"],
+        "backend": book_info.get("backend"),
         "model": book_info.get("model"),
         "language": book_info.get("language", "en"),
     }
@@ -515,6 +532,7 @@ def run_prepare_stage(
     book_info = {
         "folder_name": str(paths.run_dir),
         "audio_extension": config.audio_extension,
+        "backend": config.backend,
         "model": config.model,
         "language": config.language,
     }
@@ -565,6 +583,7 @@ def run_transcribe_stage(
     logger: logging.Logger,
 ) -> dict[str, Any]:
     book_info = build_book_info(state, paths)
+    book_info["backend"] = config.backend
     book_info["model"] = config.model
     book_info["language"] = config.language
 

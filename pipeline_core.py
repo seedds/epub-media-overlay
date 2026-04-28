@@ -156,8 +156,12 @@ from pathlib import Path
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from tqdm import tqdm
 
-from mlx_whisperx import transcribe
 from mark_sentence import mark_sentences
+from transcription_backend import (
+    default_model_for_backend,
+    detect_transcription_backend,
+    transcribe_file,
+)
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 warnings.filterwarnings("ignore", category=UserWarning, module="zipfile")
@@ -438,16 +442,18 @@ def transcribe_audio(book_info):
     # Transcription is per split audio chunk, not against the original `.m4b`. The
     # sibling JSON files become the canonical transcript inputs for both matching and
     # fine-grained timestamp alignment.
-    model = book_info.get("model") or "mlx-community/whisper-turbo"
+    backend = book_info.get("backend") or detect_transcription_backend()
+    model = book_info.get("model") or default_model_for_backend(backend)
     language = book_info.get("language") or "en"
 
     for file in sorted(glob.glob(f"*{book_info['audio_extension']}")):
         if not os.path.exists(file.replace(book_info["audio_extension"], ".json")):
             print("✅ " + file)
-            result = transcribe(
+            result = transcribe_file(
                 file,
-                model=model,
-                language=language,
+                model,
+                language,
+                backend,
             )
             with open(file.replace(book_info["audio_extension"], ".json"), 'w', encoding="utf-8") as f:
                 json.dump(result, f, ensure_ascii=False)
@@ -471,7 +477,7 @@ def link_html_with_audio(book_info):
 
     print(f"Starting linking process for EPUB: {epub_path}")
     if model:
-        print(f"Model available: {model.__class__.__name__}")
+        print(f"Transcription model recorded for this run: {model}")
     else:
         print("Model not provided. Using lexical window matching.")
 
