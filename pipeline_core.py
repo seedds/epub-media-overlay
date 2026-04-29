@@ -38,8 +38,10 @@ Pipeline overview
 
 2. Split the audiobook into manageable chunks.
    `split_m4b()` uses `ffprobe` chapter metadata and `ffmpeg` to create numbered
-   audio files (`000.m4a`, `001.m4a`, ...). These chapter markers are only a starting
-   point; later matching can still place a chunk into the middle of an HTML file.
+   audio files (`000.m4a`, `001.m4a`, ...). The default split mode is stream copy so
+   packaged overlay audio keeps source quality unless the operator explicitly asks for
+   AAC re-encoding. These chapter markers are only a starting point; later matching can
+   still place a chunk into the middle of an HTML file.
 
 3. Transcribe each audio chunk.
    `transcribe_audio()` produces sibling WhisperX JSON files. These `.json` files are
@@ -87,6 +89,9 @@ Typical keys include:
 - `out_file`: working `.epub3` file that gets mutated and later moved
 - `opf_file`, `opf_dir`: package metadata derived from the working EPUB
 - `audio_extension`: output split-audio extension, usually `.m4a`
+- `audio_codec`: split-audio codec profile, usually `copy`
+- `audio_bitrate`, `audio_sample_rate`, `audio_channels`: optional AAC re-encode
+  settings used only when `audio_codec` is `aac`
 - `model`: optional semantic model handle (historically used for embeddings)
 - `matched_list`: the bridge artifact between semantic matching and timestamp
   alignment
@@ -389,7 +394,8 @@ def get_spine_ordered_html_files(zip_file):
 def split_m4b(book_info):
     # The chapter markers embedded in the audiobook are useful for creating chunks, but
     # they are not trusted as final semantic matches to the book text. They simply give
-    # us manageable audio segments for transcription and later matching.
+    # us manageable audio segments for transcription and later matching. By default the
+    # chunks are stream-copied so the packaged overlay keeps source audio quality.
     output = subprocess.check_output(
         [
             "ffprobe",
@@ -417,6 +423,19 @@ def split_m4b(book_info):
         if os.path.exists(out_name):
             continue
 
+        audio_codec = book_info.get("audio_codec", "copy")
+        ffmpeg_audio_args = ["-c:a", "copy"]
+        if audio_codec == "aac":
+            ffmpeg_audio_args = ["-c:a", "aac"]
+            if book_info.get("audio_bitrate"):
+                ffmpeg_audio_args.extend(["-b:a", book_info["audio_bitrate"]])
+            if book_info.get("audio_sample_rate"):
+                ffmpeg_audio_args.extend(["-ar", str(book_info["audio_sample_rate"])])
+            if book_info.get("audio_channels"):
+                ffmpeg_audio_args.extend(["-ac", str(book_info["audio_channels"])])
+        elif audio_codec != "copy":
+            raise ValueError(f"Unsupported audio codec profile: {audio_codec}")
+
         # Keep the console focused on overall progress. If ffmpeg fails, surface only
         # its error output for the chunk that failed.
         result = subprocess.run(
@@ -433,14 +452,7 @@ def split_m4b(book_info):
                 "-to",
                 end_time,
                 "-vn",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "64k",
-                "-ar",
-                "24000",
-                "-ac",
-                "1",
+                *ffmpeg_audio_args,
                 os.path.join(book_info["folder_name"], out_name),
             ],
             check=False,

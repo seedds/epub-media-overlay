@@ -59,6 +59,10 @@ class PipelineConfig:
     model: str
     language: str
     audio_extension: str
+    audio_codec: str
+    audio_bitrate: str | None
+    audio_sample_rate: int | None
+    audio_channels: int | None
 
 
 @dataclass(frozen=True)
@@ -127,6 +131,10 @@ def default_state(signature: dict[str, Any], config: PipelineConfig, paths: Runt
             "model": config.model,
             "language": config.language,
             "audio_extension": config.audio_extension,
+            "audio_codec": config.audio_codec,
+            "audio_bitrate": config.audio_bitrate,
+            "audio_sample_rate": config.audio_sample_rate,
+            "audio_channels": config.audio_channels,
             "output_path": str(paths.output_path),
             "work_dir": str(paths.root),
         },
@@ -177,6 +185,10 @@ def build_signature(config: PipelineConfig) -> dict[str, Any]:
         "model": config.model,
         "language": config.language,
         "audio_extension": config.audio_extension,
+        "audio_codec": config.audio_codec,
+        "audio_bitrate": config.audio_bitrate,
+        "audio_sample_rate": config.audio_sample_rate,
+        "audio_channels": config.audio_channels,
     }
 
 
@@ -244,11 +256,47 @@ def parse_args() -> PipelineConfig:
         help="Audio chunk extension produced during splitting",
     )
     parser.add_argument(
+        "--audio-codec",
+        choices=("copy", "aac"),
+        default="copy",
+        help="Codec used for split audio chunks",
+    )
+    parser.add_argument(
+        "--audio-bitrate",
+        help="AAC bitrate for split audio chunks, such as 64k or 128k",
+    )
+    parser.add_argument(
+        "--audio-sample-rate",
+        type=int,
+        help="AAC sample rate for split audio chunks in Hz",
+    )
+    parser.add_argument(
+        "--audio-channels",
+        type=int,
+        help="AAC channel count for split audio chunks",
+    )
+    parser.add_argument(
         "--fresh",
         action="store_true",
         help="Discard any existing working state and restart from scratch instead of resuming automatically",
     )
     args = parser.parse_args()
+
+    if args.audio_codec == "copy":
+        copy_only_flags = []
+        if args.audio_bitrate is not None:
+            copy_only_flags.append("--audio-bitrate")
+        if args.audio_sample_rate is not None:
+            copy_only_flags.append("--audio-sample-rate")
+        if args.audio_channels is not None:
+            copy_only_flags.append("--audio-channels")
+        if copy_only_flags:
+            parser.error(f"{', '.join(copy_only_flags)} require --audio-codec aac")
+
+    if args.audio_sample_rate is not None and args.audio_sample_rate <= 0:
+        parser.error("--audio-sample-rate must be a positive integer")
+    if args.audio_channels is not None and args.audio_channels <= 0:
+        parser.error("--audio-channels must be a positive integer")
 
     m4b = Path(args.m4b).expanduser().resolve()
     epub = Path(args.epub).expanduser().resolve()
@@ -277,6 +325,10 @@ def parse_args() -> PipelineConfig:
         model=model,
         language=args.language,
         audio_extension=args.audio_extension,
+        audio_codec=args.audio_codec,
+        audio_bitrate=args.audio_bitrate,
+        audio_sample_rate=args.audio_sample_rate,
+        audio_channels=args.audio_channels,
     )
 
 
@@ -378,6 +430,17 @@ def log_run_header(
     logger.info("Transcription backend: %s", config.backend)
     logger.info("Transcription model: %s", config.model)
     logger.info("Transcription language: %s", config.language)
+    logger.info("Split audio codec: %s", config.audio_codec)
+    if config.audio_codec == "aac":
+        logger.info("Split audio bitrate: %s", config.audio_bitrate or "source default")
+        logger.info(
+            "Split audio sample rate: %s",
+            config.audio_sample_rate or "source default",
+        )
+        logger.info(
+            "Split audio channels: %s",
+            config.audio_channels or "source default",
+        )
     logger.info("Output EPUB: %s", config.output_path)
     logger.info("Work dir: %s", paths.root)
     logger.info("Detailed log: %s", paths.logs_dir / "pipeline.log")
@@ -410,6 +473,10 @@ def refresh_working_epub(legacy: Any, book_info: dict[str, Any], run_dir: Path) 
     refreshed = {
         "folder_name": str(run_dir),
         "audio_extension": book_info["audio_extension"],
+        "audio_codec": book_info.get("audio_codec", "copy"),
+        "audio_bitrate": book_info.get("audio_bitrate"),
+        "audio_sample_rate": book_info.get("audio_sample_rate"),
+        "audio_channels": book_info.get("audio_channels"),
         "backend": book_info.get("backend"),
         "model": book_info.get("model"),
         "language": book_info.get("language", "en"),
@@ -532,6 +599,10 @@ def run_prepare_stage(
     book_info = {
         "folder_name": str(paths.run_dir),
         "audio_extension": config.audio_extension,
+        "audio_codec": config.audio_codec,
+        "audio_bitrate": config.audio_bitrate,
+        "audio_sample_rate": config.audio_sample_rate,
+        "audio_channels": config.audio_channels,
         "backend": config.backend,
         "model": config.model,
         "language": config.language,

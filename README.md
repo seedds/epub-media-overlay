@@ -42,6 +42,12 @@ python generate_epub_overlay.py \
   --epub /path/to/book.epub
 ```
 
+Split-audio defaults:
+
+- `--audio-codec copy` preserves source audio quality in the packaged Media Overlay EPUB
+- this usually makes splitting much faster than re-encoding
+- output EPUB size can increase because packaged audio stays near source quality
+
 Transcription defaults:
 
 - Apple Silicon macOS model: `mlx-community/whisper-turbo`
@@ -61,6 +67,20 @@ python generate_epub_overlay.py \
 ```
 
 Model names depend on the selected backend. For example, non-MLX platforms should use standard Whisper or WhisperX model names such as `small`, `medium`, `large`, or `large-v2`.
+
+Optional split-audio re-encode controls:
+
+```bash
+python generate_epub_overlay.py \
+  --m4b /path/to/book.m4b \
+  --epub /path/to/book.epub \
+  --audio-codec aac \
+  --audio-bitrate 96k \
+  --audio-sample-rate 44100 \
+  --audio-channels 2
+```
+
+When `--audio-codec aac` is selected, you can optionally set bitrate, sample rate, and channel count. These flags are rejected when `--audio-codec copy` is in use.
 
 Run behavior:
 
@@ -101,6 +121,7 @@ Important working artifacts:
 
 - The source `.epub` is not modified directly.
 - The pipeline expects chapter metadata in the input `.m4b` for chunk generation.
+- Split audio defaults to stream copy so packaged playback preserves source quality.
 - Validation checks packaging, SMIL clip quality, transcript coverage, and OPF media-overlay wiring.
 - The console output and `logs/pipeline.log` include detailed stage-by-stage progress and timings.
 
