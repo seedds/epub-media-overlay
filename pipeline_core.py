@@ -536,11 +536,112 @@ def link_html_with_audio(book_info):
     overlap_threshold = 6
     combined_score_threshold = 0.35
     top_k_windows = 24
+    continuation_overlap_backtrack = 24
     preprocess_stats = {
         "decode_fallbacks": 0,
         "html_skipped_short": 0,
         "html_errors": 0,
     }
+    html_token_map = {}
+    candidates_by_file = defaultdict(list)
+
+    def score_probe_candidates(probe_tokens, probe_match_tokens, candidates, min_allowed_index):
+        if not probe_match_tokens or not candidates:
+            return None, 0.0, 0
+
+        probe_counter = Counter(probe_match_tokens)
+        overlap_scored_candidates = []
+        for candidate in candidates:
+            overlap_count = sum(
+                min(probe_counter[token], candidate["match_counter"].get(token, 0))
+                for token in probe_counter
+            )
+            if overlap_count > 0:
+                overlap_scored_candidates.append((overlap_count, candidate))
+
+        if not overlap_scored_candidates:
+            return None, 0.0, 0
+
+        overlap_scored_candidates.sort(
+            key=lambda item: (item[0], -item[1]["global_index"]), reverse=True
+        )
+
+        best_match = None
+        best_score = 0.0
+        best_overlap = 0
+        for overlap_count, candidate in overlap_scored_candidates[:top_k_windows]:
+            sequence_score = difflib.SequenceMatcher(
+                None,
+                candidate["window_tokens"][: len(probe_tokens)],
+                probe_tokens,
+                autojunk=False,
+            ).ratio()
+            overlap_score = overlap_count / max(1, len(probe_match_tokens))
+            order_bonus = 0.02 if candidate["global_index"] >= min_allowed_index else 0.0
+            combined_score = (overlap_score * 0.7) + (sequence_score * 0.3) + order_bonus
+            if combined_score > best_score:
+                best_score = combined_score
+                best_overlap = overlap_count
+                best_match = candidate
+
+        return best_match, best_score, best_overlap
+
+    def estimate_audio_boundary(
+        html_tokens,
+        audio_tokens,
+        start_audio_index=0,
+        window_hint=None,
+    ):
+        if start_audio_index >= len(audio_tokens) or not html_tokens:
+            return None
+
+        if window_hint is None:
+            search_start = 0
+        else:
+            search_start = min(len(html_tokens), max(0, window_hint - 250))
+        audio_token_count = len(audio_tokens) - start_audio_index
+        hinted_end = (window_hint or 0) + audio_token_count + 400
+        search_end = min(
+            len(html_tokens),
+            max(hinted_end, search_start + audio_token_count + 1200),
+        )
+
+        search_ranges = [(search_start, max(search_start, search_end))]
+        if search_end < len(html_tokens):
+            search_ranges.append((search_start, len(html_tokens)))
+        if search_start > 0:
+            search_ranges.append((0, len(html_tokens)))
+
+        best_alignment = None
+        for range_start, range_end in search_ranges:
+            if range_end <= range_start:
+                continue
+
+            html_slice = html_tokens[range_start:range_end]
+            if not html_slice:
+                continue
+
+            matcher = difflib.SequenceMatcher(
+                None,
+                [token["token"] for token in html_slice],
+                [token["token"] for token in audio_tokens[start_audio_index:]],
+                autojunk=False,
+            )
+            alignment = summarize_alignment(
+                matcher.get_opcodes(),
+                html_offset=range_start,
+                audio_offset=start_audio_index,
+            )
+            if (
+                best_alignment is None
+                or alignment["matched_token_count"] > best_alignment["matched_token_count"]
+            ):
+                best_alignment = alignment
+
+            if alignment["matched_token_count"] >= max(25, int(audio_token_count * 0.2)):
+                break
+
+        return best_alignment
 
     # Step 1: build a candidate window index over EPUB text.
     # Candidate records carry file identity, token offsets, lexical counters, and a
@@ -581,6 +682,8 @@ def link_html_with_audio(book_info):
                         if len(token_items) < 5:
                             preprocess_stats["html_skipped_short"] += 1
                             continue
+
+                        html_token_map[file_name] = token_items
 
                         max_start = max(0, len(token_items) - window_size)
                         window_starts = list(range(0, max_start + 1, window_step)) or [0]
@@ -629,6 +732,7 @@ def link_html_with_audio(book_info):
                                     "global_index": len(epub_candidates),
                                 }
                             )
+                            candidates_by_file[file_name].append(epub_candidates[-1])
 
                 except Exception:
                     preprocess_stats["html_errors"] += 1
@@ -663,11 +767,13 @@ def link_html_with_audio(book_info):
     json_files = sorted(glob.glob("*.json"))
     last_global_index = 0
     match_stats = {
+        "matched_transcripts": 0,
         "json_skipped_short": 0,
         "json_skipped_probe": 0,
         "no_overlap": 0,
         "no_candidate": 0,
         "below_threshold": 0,
+        "continuation_spans": 0,
         "backward_warnings": 0,
         "decode_errors": 0,
         "processing_errors": 0,
@@ -697,52 +803,24 @@ def link_html_with_audio(book_info):
             if not probe_match_tokens:
                 match_stats["json_skipped_probe"] += 1
                 continue
-            probe_counter = Counter(probe_match_tokens)
-
             min_allowed_index = max(0, last_global_index - 1)
-            # First pass: cheap lexical overlap filter.
-            overlap_scored_candidates = []
-            for candidate in epub_candidates:
-                overlap_count = sum(
-                    min(probe_counter[token], candidate["match_counter"].get(token, 0))
-                    for token in probe_counter
-                )
-                if overlap_count > 0:
-                    overlap_scored_candidates.append((overlap_count, candidate))
-
-            if not overlap_scored_candidates:
-                match_stats["no_overlap"] += 1
-                continue
-
-            overlap_scored_candidates.sort(
-                key=lambda item: (item[0], -item[1]["global_index"]), reverse=True
+            best_match, best_score, best_overlap = score_probe_candidates(
+                probe_tokens,
+                probe_match_tokens,
+                epub_candidates,
+                min_allowed_index,
             )
 
-            best_match = None
-            best_score = 0.0
-            best_overlap = 0
-            # Second pass: score local token order and add a small forward-order bias.
-            for overlap_count, candidate in overlap_scored_candidates[:top_k_windows]:
-                sequence_score = difflib.SequenceMatcher(
-                    None,
-                    candidate["window_tokens"][: len(probe_tokens)],
-                    probe_tokens,
-                    autojunk=False,
-                ).ratio()
-                overlap_score = overlap_count / max(1, len(probe_match_tokens))
-                order_bonus = 0.02 if candidate["global_index"] >= min_allowed_index else 0.0
-                combined_score = (overlap_score * 0.7) + (sequence_score * 0.3) + order_bonus
-                if combined_score > best_score:
-                    best_score = combined_score
-                    best_overlap = overlap_count
-                    best_match = candidate
+            if best_match is None and best_overlap == 0:
+                match_stats["no_overlap"] += 1
+                continue
 
             if best_match is None:
                 match_stats["no_candidate"] += 1
                 continue
 
             if best_score >= combined_score_threshold and best_overlap >= overlap_threshold:
-                matched_list.append(
+                span_matches = [
                     {
                         "json_file": json_file,
                         "html_file": best_match["file_name"],
@@ -752,9 +830,120 @@ def link_html_with_audio(book_info):
                         "window_start": best_match["window_start"],
                         "window_end": best_match["window_end"],
                         "candidate_index": best_match["global_index"],
+                        "span_index": 0,
+                        "audio_start_index": 0,
+                        "audio_end_index": len(audio_tokens) - 1,
                     }
+                ]
+
+                current_file = best_match["file_name"]
+                current_alignment = estimate_audio_boundary(
+                    html_token_map.get(current_file, []),
+                    audio_tokens,
+                    start_audio_index=0,
+                    window_hint=best_match["window_start"],
                 )
-                last_global_index = best_match["global_index"]
+                current_audio_cursor = 0
+                if current_alignment and current_alignment["max_audio_idx"] >= 0:
+                    current_audio_cursor = max(
+                        0,
+                        current_alignment["max_audio_idx"] - continuation_overlap_backtrack + 1,
+                    )
+
+                current_html_order = best_match["html_order"]
+                while current_audio_cursor < len(audio_tokens):
+                    next_html_order = current_html_order + 1
+                    if next_html_order >= len(html_files):
+                        break
+
+                    next_file = html_files[next_html_order]
+                    next_file_candidates = [
+                        candidate
+                        for candidate in candidates_by_file.get(next_file, [])
+                        if candidate["window_start"] <= window_size * 2
+                    ]
+                    if not next_file_candidates:
+                        next_file_candidates = candidates_by_file.get(next_file, [])
+                    if not next_file_candidates:
+                        break
+
+                    continuation_probe_tokens = [
+                        item["token"]
+                        for item in audio_tokens[current_audio_cursor : current_audio_cursor + 120]
+                        if item["token"]
+                    ]
+                    continuation_probe_match_tokens = [
+                        token
+                        for token in continuation_probe_tokens
+                        if len(token) >= overlap_token_min_length
+                    ]
+                    if not continuation_probe_match_tokens:
+                        break
+
+                    continuation_match, continuation_score, continuation_overlap = score_probe_candidates(
+                        continuation_probe_tokens,
+                        continuation_probe_match_tokens,
+                        next_file_candidates,
+                        best_match["global_index"],
+                    )
+                    if (
+                        continuation_match is None
+                        or continuation_score < combined_score_threshold
+                        or continuation_overlap < overlap_threshold
+                    ):
+                        break
+
+                    span_matches.append(
+                        {
+                            "json_file": json_file,
+                            "html_file": continuation_match["file_name"],
+                            "score": float(continuation_score),
+                            "html_order": continuation_match["html_order"],
+                            "window_index": continuation_match["window_index"],
+                            "window_start": continuation_match["window_start"],
+                            "window_end": continuation_match["window_end"],
+                            "candidate_index": continuation_match["global_index"],
+                            "span_index": len(span_matches),
+                            "audio_start_index": current_audio_cursor,
+                            "audio_end_index": len(audio_tokens) - 1,
+                        }
+                    )
+
+                    continuation_alignment = estimate_audio_boundary(
+                        html_token_map.get(next_file, []),
+                        audio_tokens,
+                        start_audio_index=current_audio_cursor,
+                        window_hint=continuation_match["window_start"],
+                    )
+                    if (
+                        not continuation_alignment
+                        or continuation_alignment["max_audio_idx"] <= current_audio_cursor
+                    ):
+                        span_matches.pop()
+                        break
+
+                    current_audio_cursor = max(
+                        current_audio_cursor,
+                        continuation_alignment["max_audio_idx"] - continuation_overlap_backtrack + 1,
+                    )
+                    current_file = next_file
+                    current_html_order = next_html_order
+                    match_stats["continuation_spans"] += 1
+
+                for index, span_match in enumerate(span_matches):
+                    next_start = (
+                        span_matches[index + 1]["audio_start_index"]
+                        if index + 1 < len(span_matches)
+                        else len(audio_tokens)
+                    )
+                    span_match["audio_end_index"] = max(
+                        span_match["audio_start_index"],
+                        next_start - 1,
+                    )
+                    matched_list.append(span_match)
+
+                match_stats["matched_transcripts"] += 1
+                last_global_index = span_matches[-1]["candidate_index"]
             else:
                 match_stats["below_threshold"] += 1
                 continue
@@ -779,7 +968,9 @@ def link_html_with_audio(book_info):
     print_nonzero_summary(
         "Matching summary",
         [
-            ("matched transcript(s)", len(matched_list)),
+            ("matched transcript(s)", match_stats["matched_transcripts"]),
+            ("transcript-to-HTML link(s)", len(matched_list)),
+            ("additional consecutive span(s)", match_stats["continuation_spans"]),
             ("low-content transcript(s) skipped", match_stats["json_skipped_short"]),
             ("transcript(s) skipped for missing probe tokens", match_stats["json_skipped_probe"]),
             ("transcript(s) with no lexical overlap", match_stats["no_overlap"]),
@@ -901,6 +1092,9 @@ def normalize_match_item(item):
         normalized["candidate_index"] = int(
             normalized.get("candidate_index", normalized.get("window_index", 0))
         )
+        normalized["span_index"] = int(normalized.get("span_index", 0))
+        normalized["audio_start_index"] = int(normalized.get("audio_start_index", 0))
+        normalized["audio_end_index"] = int(normalized.get("audio_end_index", -1))
         return normalized
 
     if isinstance(item, (list, tuple)) and len(item) >= 2:
@@ -912,6 +1106,9 @@ def normalize_match_item(item):
             "window_end": 0,
             "html_order": 0,
             "candidate_index": 0,
+            "span_index": 0,
+            "audio_start_index": 0,
+            "audio_end_index": -1,
         }
 
     raise ValueError(f"Unsupported matched item: {item}")
@@ -921,6 +1118,25 @@ def normalize_matched_list(matched_list):
     return [normalize_match_item(item) for item in matched_list]
 
 
+def sort_matched_items(matched_list):
+    return sorted(
+        normalize_matched_list(matched_list),
+        key=lambda item: (
+            item["json_file"],
+            item["span_index"],
+            item["html_order"],
+            item["candidate_index"],
+        ),
+    )
+
+
+def iter_matched_json_groups(matched_list):
+    grouped = {}
+    for item in sort_matched_items(matched_list):
+        grouped.setdefault(item["json_file"], []).append(item)
+    return grouped.items()
+
+
 def extract_text_token_items(text):
     token_items = []
     for word in text.split():
@@ -928,6 +1144,37 @@ def extract_text_token_items(text):
         if token:
             token_items.append({"display": word, "token": token})
     return token_items
+
+
+def summarize_alignment(opcodes, html_offset=0, audio_offset=0):
+    matched_token_count = 0
+    max_html_idx = html_offset - 1
+    min_audio_idx = None
+    max_audio_idx = audio_offset - 1
+
+    for tag, i1, i2, j1, j2 in opcodes:
+        if tag != "equal":
+            continue
+
+        matched_count = min(i2 - i1, j2 - j1)
+        if matched_count <= 0:
+            continue
+
+        matched_token_count += matched_count
+        max_html_idx = max(max_html_idx, html_offset + i1 + matched_count - 1)
+        matched_start = audio_offset + j1
+        matched_end = matched_start + matched_count - 1
+        min_audio_idx = matched_start if min_audio_idx is None else min(
+            min_audio_idx, matched_start
+        )
+        max_audio_idx = max(max_audio_idx, matched_end)
+
+    return {
+        "matched_token_count": matched_token_count,
+        "max_html_idx": max_html_idx,
+        "min_audio_idx": min_audio_idx,
+        "max_audio_idx": max_audio_idx,
+    }
 
 
 def load_audio_tokens(json_file):
@@ -981,13 +1228,15 @@ def load_html_segments_and_tokens(zip_path, html_file):
     return segments, html_tokens
 
 
-def build_raw_matches(opcodes, html_tokens, audio_tokens, html_offset=0):
+def build_raw_matches(opcodes, html_tokens, audio_tokens, html_offset=0, audio_offset=0):
     # `SequenceMatcher` yields equal runs in token space. This helper turns those runs
     # into per-segment timestamp envelopes by collecting every transcript token that
     # aligned to a given HTML segment.
     raw_matches = {}
     matched_token_count = 0
     max_html_idx = html_offset - 1
+    min_audio_idx = None
+    max_audio_idx = audio_offset - 1
 
     for tag, i1, i2, j1, j2 in opcodes:
         if tag != "equal":
@@ -995,7 +1244,7 @@ def build_raw_matches(opcodes, html_tokens, audio_tokens, html_offset=0):
 
         for relative_html_idx in range(i1, i2):
             offset = relative_html_idx - i1
-            audio_idx = j1 + offset
+            audio_idx = audio_offset + j1 + offset
             if audio_idx >= len(audio_tokens):
                 break
 
@@ -1016,17 +1265,15 @@ def build_raw_matches(opcodes, html_tokens, audio_tokens, html_offset=0):
             raw_matches[seg_id]["audio_text_parts"].append((audio_idx, audio_info["word"]))
             matched_token_count += 1
             max_html_idx = max(max_html_idx, html_idx)
+            min_audio_idx = audio_idx if min_audio_idx is None else min(min_audio_idx, audio_idx)
+            max_audio_idx = max(max_audio_idx, audio_idx)
 
-    return raw_matches, matched_token_count, max_html_idx
+    return raw_matches, matched_token_count, max_html_idx, min_audio_idx, max_audio_idx
 
 
-def finalize_segment_timestamps(raw_matches, segments, total_duration):
+def build_segment_match_list(raw_matches, segments):
     # Raw equal-token matches are usually sparse and jagged. This function turns them
-    # into monotonically ordered segment timings by:
-    # - ordering them by segment appearance
-    # - gap-closing neighboring segments
-    # - anchoring the first start to 0 and the last end to the full audio duration
-    # - applying a small negative shift so highlights feel less late to the reader
+    # into a segment-ordered list before later timing normalization.
     matched_ordered_list = []
     for seg_index, seg in enumerate(segments):
         seg_id = seg.get("id")
@@ -1045,12 +1292,23 @@ def finalize_segment_timestamps(raw_matches, segments, total_duration):
             }
         )
 
+    return matched_ordered_list
+
+
+def finalize_segment_timestamps(matched_ordered_list, total_duration, anchor_start=True, anchor_end=True):
+    # This finalizer closes gaps between matched segments, optionally anchors the
+    # global chunk boundaries, and applies a small negative shift so highlights feel
+    # less late to the reader.
+    matched_ordered_list = [dict(item) for item in matched_ordered_list]
+
     if matched_ordered_list:
         for i in range(len(matched_ordered_list) - 1):
             matched_ordered_list[i]["end"] = matched_ordered_list[i + 1]["start"]
 
-        matched_ordered_list[0]["start"] = 0.0
-        matched_ordered_list[-1]["end"] = total_duration
+        if anchor_start:
+            matched_ordered_list[0]["start"] = 0.0
+        if anchor_end:
+            matched_ordered_list[-1]["end"] = total_duration
 
         for i, obj in enumerate(matched_ordered_list):
             if i == 0:
@@ -1808,6 +2066,120 @@ def test_overlay_without_audio(book_info):
     )
 
 
+def test_unmatched_spine_html(book_info, min_token_count=80):
+    # This check looks for substantive reading-order HTML files that fall between the
+    # first and last matched chapters but never received any match row. Those files are
+    # the clearest signal that playback coverage silently skipped part of the book.
+    matched_items = normalize_matched_list(book_info.get("matched_list", []))
+    if not matched_items:
+        return build_check_result(
+            "unmatched_spine_html",
+            True,
+            "No matched HTML files were provided in book_info.",
+            metrics={"matched_html_files": 0},
+            skipped=True,
+        )
+
+    epub_path = get_packaged_epub_path(book_info)
+    if not epub_path:
+        fallback_path = book_info.get("out_file") or book_info.get("epub_file")
+        epub_path = resolve_book_path(book_info, fallback_path) if fallback_path else None
+    if not epub_path or not os.path.exists(epub_path):
+        return build_check_result(
+            "unmatched_spine_html",
+            True,
+            "No EPUB package was available for unmatched-HTML validation.",
+            metrics={"matched_html_files": len({item['html_file'] for item in matched_items})},
+            skipped=True,
+        )
+
+    try:
+        with zipfile.ZipFile(epub_path, "r") as zf:
+            spine_html_files = get_spine_ordered_html_files(zf)
+            if not spine_html_files:
+                return build_check_result(
+                    "unmatched_spine_html",
+                    True,
+                    "No HTML files were found in the EPUB for unmatched-HTML validation.",
+                    metrics={"epub_path": epub_path, "spine_html_files": 0},
+                    skipped=True,
+                )
+
+            spine_index_map = {html_file: index for index, html_file in enumerate(spine_html_files)}
+            matched_set = {item["html_file"] for item in matched_items}
+            matched_indices = sorted(
+                spine_index_map[item["html_file"]]
+                for item in matched_items
+                if item["html_file"] in spine_index_map
+            )
+            if not matched_indices:
+                return build_check_result(
+                    "unmatched_spine_html",
+                    True,
+                    "No matched HTML files could be located in the EPUB spine order.",
+                    metrics={"epub_path": epub_path, "matched_html_files": len(matched_set)},
+                    skipped=True,
+                )
+
+            findings = []
+            for spine_index in range(matched_indices[0], matched_indices[-1] + 1):
+                html_file = spine_html_files[spine_index]
+                if html_file in matched_set:
+                    continue
+
+                try:
+                    with zf.open(html_file) as f:
+                        raw_html = f.read()
+                    try:
+                        html_content = raw_html.decode("utf-8")
+                    except UnicodeDecodeError:
+                        html_content = raw_html.decode("latin-1", errors="replace")
+                except Exception:
+                    continue
+
+                soup = BeautifulSoup(html_content, "lxml")
+                for script_or_style in soup(["script", "style"]):
+                    script_or_style.decompose()
+                token_count = len(
+                    extract_text_token_items(soup.get_text(separator=" ", strip=True))
+                )
+                if token_count < min_token_count:
+                    continue
+
+                findings.append(
+                    {
+                        "html_file": html_file,
+                        "spine_index": spine_index,
+                        "token_count": token_count,
+                        "issue": "substantive_spine_html_without_match",
+                    }
+                )
+    except (zipfile.BadZipFile, OSError):
+        return build_check_result(
+            "unmatched_spine_html",
+            True,
+            "The EPUB package could not be opened for unmatched-HTML validation.",
+            metrics={"epub_path": epub_path},
+            skipped=True,
+        )
+
+    return build_check_result(
+        "unmatched_spine_html",
+        ok=not findings,
+        summary=(
+            "All substantive spine HTML files between the matched boundaries received overlay coverage."
+            if not findings
+            else f"{len(findings)} substantive spine HTML file(s) were skipped by matching."
+        ),
+        findings=findings,
+        metrics={
+            "epub_path": epub_path,
+            "matched_html_files": len(matched_set),
+            "min_token_count": min_token_count,
+        },
+    )
+
+
 def test_missing_media_overlays(book_info):
     # This is the packaged-EPUB-side counterpart to the loose SMIL checks above. It
     # verifies that each matched HTML file is actually wired in the OPF to its overlay
@@ -1929,6 +2301,7 @@ def run_post_checks(
         ),
         test_invalid_smil_clips(book_info),
         test_overlay_without_audio(book_info),
+        test_unmatched_spine_html(book_info),
         test_missing_media_overlays(book_info),
     ]
     ok_results = sum(1 for result in results if result["ok"] and not result["skipped"])
@@ -1950,59 +2323,82 @@ def run_post_checks(
 def create_smil_files(book_info, skip=True):
     # Output model:
     # one HTML file -> one SMIL file, even when several audio chunks contribute to it.
-    matched_items = normalize_matched_list(book_info["matched_list"])
+    matched_items = sort_matched_items(book_info["matched_list"])
     if not skip:
         for file in glob.glob("*.smil"):
             os.remove(file)
-
-    html_groups = {}
-    for item in matched_items:
-        html_groups.setdefault(item["html_file"], []).append(item)
 
     alignment_stats = {
         "no_audio_tokens": 0,
         "no_alignment": 0,
         "no_segments": 0,
     }
+    matched_html_files = list(dict.fromkeys(item["html_file"] for item in matched_items))
+    aggregated_matches_by_html = {html_file: {} for html_file in matched_html_files}
 
-    for html_file, items in tqdm(html_groups.items(), desc="Generating SMIL", unit="file"):
-        smil_filename = make_overlay_basename(html_file)
-
-        if os.path.exists(smil_filename) and skip:
+    for json_file, items in tqdm(
+        iter_matched_json_groups(matched_items),
+        desc="Generating SMIL",
+        unit="chunk",
+    ):
+        audio_tokens = load_audio_tokens(json_file)
+        if not audio_tokens:
+            alignment_stats["no_audio_tokens"] += 1
             continue
 
-        # Alignment target is the marked HTML already stored in the working EPUB.
-        segments, html_tokens = load_html_segments_and_tokens(book_info["out_file"], html_file)
-        aggregated_matches = {}
-        last_html_idx = 0
+        audio_filename = json_file.replace(".json", book_info["audio_extension"])
+        total_duration = get_audio_duration(
+            os.path.join(book_info["folder_name"], audio_filename),
+            [],
+        )
+        audio_cursor = 0
+        chunk_segment_matches = []
 
         for item in items:
-            json_file = item["json_file"]
-            audio_tokens = load_audio_tokens(json_file)
-            if not audio_tokens:
-                alignment_stats["no_audio_tokens"] += 1
+            segments, html_tokens = load_html_segments_and_tokens(
+                book_info["out_file"], item["html_file"]
+            )
+            if not html_tokens:
+                alignment_stats["no_segments"] += 1
                 continue
 
-            audio_filename = json_file.replace(".json", book_info["audio_extension"])
-            # Search locally around the matched window first; widen only if needed.
-            search_start = min(
-                len(html_tokens),
-                max(last_html_idx, max(0, item["window_start"] - 250)),
-            )
-            search_end = min(
-                len(html_tokens),
-                max(
-                    item["window_end"] + len(audio_tokens) + 400,
-                    search_start + len(audio_tokens) + 1200,
-                ),
-            )
+            audio_start_hint = max(audio_cursor, item["audio_start_index"])
+            if audio_start_hint >= len(audio_tokens):
+                break
 
-            # Try progressively wider search windows before falling back to large scans.
-            search_ranges = [(search_start, max(search_start, search_end))]
-            if search_end < len(html_tokens):
-                search_ranges.append((search_start, len(html_tokens)))
-            if search_start > last_html_idx:
-                search_ranges.append((last_html_idx, len(html_tokens)))
+            audio_end_hint = item["audio_end_index"]
+            if audio_end_hint < audio_start_hint:
+                audio_end_hint = len(audio_tokens) - 1
+            audio_end_hint = min(len(audio_tokens) - 1, audio_end_hint)
+            audio_slice = audio_tokens[audio_start_hint : audio_end_hint + 1]
+            if not audio_slice:
+                break
+
+            if item["span_index"] == 0:
+                search_start = min(
+                    len(html_tokens),
+                    max(0, item["window_start"] - 250),
+                )
+                search_end = min(
+                    len(html_tokens),
+                    max(
+                        item["window_end"] + len(audio_slice) + 400,
+                        search_start + len(audio_slice) + 1200,
+                    ),
+                )
+                search_ranges = [(search_start, max(search_start, search_end))]
+                if search_end < len(html_tokens):
+                    search_ranges.append((search_start, len(html_tokens)))
+                if search_start > 0:
+                    search_ranges.append((0, len(html_tokens)))
+            else:
+                prefix_end = min(
+                    len(html_tokens),
+                    max(item["window_end"] + len(audio_slice) + 200, len(audio_slice) + 600),
+                )
+                search_ranges = [(0, prefix_end)]
+                if prefix_end < len(html_tokens):
+                    search_ranges.append((0, len(html_tokens)))
 
             best_match = None
             for range_start, range_end in search_ranges:
@@ -2013,15 +2409,24 @@ def create_smil_files(book_info, skip=True):
                 if not html_slice:
                     continue
 
-                # This is token-level alignment, not semantic matching.
                 matcher = difflib.SequenceMatcher(
                     None,
                     [token["token"] for token in html_slice],
-                    [token["token"] for token in audio_tokens],
+                    [token["token"] for token in audio_slice],
                     autojunk=False,
                 )
-                raw_matches, matched_token_count, max_html_idx = build_raw_matches(
-                    matcher.get_opcodes(), html_tokens, audio_tokens, html_offset=range_start
+                (
+                    raw_matches,
+                    matched_token_count,
+                    max_html_idx,
+                    min_audio_idx,
+                    max_audio_idx,
+                ) = build_raw_matches(
+                    matcher.get_opcodes(),
+                    html_tokens,
+                    audio_tokens,
+                    html_offset=range_start,
+                    audio_offset=audio_start_hint,
                 )
 
                 if best_match is None or matched_token_count > best_match["matched_token_count"]:
@@ -2029,40 +2434,69 @@ def create_smil_files(book_info, skip=True):
                         "raw_matches": raw_matches,
                         "matched_token_count": matched_token_count,
                         "max_html_idx": max_html_idx,
+                        "min_audio_idx": min_audio_idx,
+                        "max_audio_idx": max_audio_idx,
                     }
 
-                if matched_token_count >= max(25, int(len(audio_tokens) * 0.2)):
+                if matched_token_count >= max(25, int(len(audio_slice) * 0.2)):
                     break
 
             if not best_match or best_match["matched_token_count"] == 0:
                 alignment_stats["no_alignment"] += 1
                 continue
 
-            matched_ordered_list = finalize_segment_timestamps(
-                best_match["raw_matches"],
-                segments,
-                get_audio_duration(
-                    os.path.join(book_info["folder_name"], audio_filename),
-                    [],
-                ),
-            )
-
-            if not matched_ordered_list:
+            segment_matches = build_segment_match_list(best_match["raw_matches"], segments)
+            if not segment_matches:
                 alignment_stats["no_segments"] += 1
                 continue
 
-            for segment_match in matched_ordered_list:
-                seg_id = segment_match["id"]
-                if seg_id in aggregated_matches:
-                    continue
+            for segment_match in segment_matches:
+                chunk_segment_matches.append(
+                    {
+                        **segment_match,
+                        "html_file": item["html_file"],
+                        "html_order": item["html_order"],
+                        "span_index": item["span_index"],
+                        "audio_file": audio_filename,
+                        "json_file": json_file,
+                    }
+                )
 
-                aggregated_matches[seg_id] = {
-                    **segment_match,
-                    "audio_file": audio_filename,
-                    "json_file": json_file,
-                }
+            if best_match["max_audio_idx"] is not None and best_match["max_audio_idx"] >= 0:
+                audio_cursor = max(audio_cursor, best_match["max_audio_idx"] + 1)
 
-            last_html_idx = max(last_html_idx, best_match["max_html_idx"] + 1)
+        if not chunk_segment_matches:
+            continue
+
+        chunk_segment_matches.sort(
+            key=lambda match: (
+                match["span_index"],
+                match["html_order"],
+                match["segment_index"],
+            )
+        )
+        final_chunk_matches = finalize_segment_timestamps(
+            chunk_segment_matches,
+            total_duration,
+        )
+
+        for segment_match in final_chunk_matches:
+            html_matches = aggregated_matches_by_html.setdefault(
+                segment_match["html_file"],
+                {},
+            )
+            seg_id = segment_match["id"]
+            if seg_id in html_matches:
+                continue
+            html_matches[seg_id] = segment_match
+
+    for html_file in tqdm(matched_html_files, desc="Writing SMIL", unit="file"):
+        smil_filename = make_overlay_basename(html_file)
+        if os.path.exists(smil_filename) and skip:
+            continue
+
+        segments, _html_tokens = load_html_segments_and_tokens(book_info["out_file"], html_file)
+        aggregated_matches = aggregated_matches_by_html.get(html_file, {})
 
         # Build the grouped SMIL shell for this one HTML file.
         soup_smil = BeautifulSoup("<smil/>", "xml")

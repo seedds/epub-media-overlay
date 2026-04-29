@@ -786,7 +786,8 @@ def run_validate_stage(
 ) -> dict[str, Any]:
     if not paths.packaged_epub_path.exists() and paths.output_path.exists():
         atomic_copy(paths.output_path, paths.packaged_epub_path)
-    book_info = build_book_info(state, paths)
+    matched_list = load_matched_list(paths) if paths.matched_list_path.exists() else None
+    book_info = build_book_info(state, paths, matched_list)
     results = legacy.run_post_checks(book_info)
     atomic_write_json(paths.validation_path, results)
     logger.info("Validation summary: %s", results["summary"])
