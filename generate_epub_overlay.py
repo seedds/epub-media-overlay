@@ -49,7 +49,7 @@ SEGMENT_ID_RE = re.compile(r'id="c[^"]+-segment\d+"')
 
 @dataclass(frozen=True)
 class PipelineConfig:
-    m4b: Path
+    audio: Path
     epub: Path
     output_dir: Path
     output_path: Path
@@ -63,6 +63,7 @@ class PipelineConfig:
     audio_bitrate: str | None
     audio_sample_rate: int | None
     audio_channels: int | None
+    chunk_seconds: int
 
 
 @dataclass(frozen=True)
@@ -123,7 +124,7 @@ def default_state(signature: dict[str, Any], config: PipelineConfig, paths: Runt
         "updated_at": now_iso(),
         "signature": signature,
         "inputs": {
-            "m4b": str(config.m4b),
+            "audio": str(config.audio),
             "epub": str(config.epub),
         },
         "config": {
@@ -135,6 +136,7 @@ def default_state(signature: dict[str, Any], config: PipelineConfig, paths: Runt
             "audio_bitrate": config.audio_bitrate,
             "audio_sample_rate": config.audio_sample_rate,
             "audio_channels": config.audio_channels,
+            "chunk_seconds": config.chunk_seconds,
             "output_path": str(paths.output_path),
             "work_dir": str(paths.root),
         },
@@ -179,7 +181,7 @@ def set_stage_state(
 
 def build_signature(config: PipelineConfig) -> dict[str, Any]:
     return {
-        "m4b": fingerprint_file(config.m4b),
+        "audio": fingerprint_file(config.audio),
         "epub": fingerprint_file(config.epub),
         "backend": config.backend,
         "model": config.model,
@@ -189,6 +191,7 @@ def build_signature(config: PipelineConfig) -> dict[str, Any]:
         "audio_bitrate": config.audio_bitrate,
         "audio_sample_rate": config.audio_sample_rate,
         "audio_channels": config.audio_channels,
+        "chunk_seconds": config.chunk_seconds,
     }
 
 
@@ -232,7 +235,7 @@ def parse_args() -> PipelineConfig:
         description="Generate a media-overlay EPUB from an audiobook and EPUB source.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--m4b", required=True, help="Input .m4b audiobook file")
+    parser.add_argument("--audio", required=True, help="Input audiobook file")
     parser.add_argument("--epub", required=True, help="Input .epub ebook file")
     parser.add_argument(
         "--output-dir",
@@ -276,6 +279,12 @@ def parse_args() -> PipelineConfig:
         help="AAC channel count for split audio chunks",
     )
     parser.add_argument(
+        "--chunk-seconds",
+        type=int,
+        default=600,
+        help="Fixed chunk length in seconds for audio files without chapters",
+    )
+    parser.add_argument(
         "--fresh",
         action="store_true",
         help="Discard any existing working state and restart from scratch instead of resuming automatically",
@@ -297,8 +306,10 @@ def parse_args() -> PipelineConfig:
         parser.error("--audio-sample-rate must be a positive integer")
     if args.audio_channels is not None and args.audio_channels <= 0:
         parser.error("--audio-channels must be a positive integer")
+    if args.chunk_seconds <= 0:
+        parser.error("--chunk-seconds must be a positive integer")
 
-    m4b = Path(args.m4b).expanduser().resolve()
+    audio = Path(args.audio).expanduser().resolve()
     epub = Path(args.epub).expanduser().resolve()
     output_dir = (
         Path(args.output_dir).expanduser().resolve()
@@ -315,7 +326,7 @@ def parse_args() -> PipelineConfig:
     model = args.model or default_model_for_backend(backend)
 
     return PipelineConfig(
-        m4b=m4b,
+        audio=audio,
         epub=epub,
         output_dir=output_dir,
         output_path=output_path,
@@ -329,6 +340,7 @@ def parse_args() -> PipelineConfig:
         audio_bitrate=args.audio_bitrate,
         audio_sample_rate=args.audio_sample_rate,
         audio_channels=args.audio_channels,
+        chunk_seconds=args.chunk_seconds,
     )
 
 
@@ -358,12 +370,10 @@ def load_pipeline_module():
 
 
 def preflight(config: PipelineConfig, logger: logging.Logger) -> None:
-    if not config.m4b.exists():
-        raise FileNotFoundError(f"Input M4B not found: {config.m4b}")
+    if not config.audio.exists():
+        raise FileNotFoundError(f"Input audio not found: {config.audio}")
     if not config.epub.exists():
         raise FileNotFoundError(f"Input EPUB not found: {config.epub}")
-    if config.m4b.suffix.lower() != ".m4b":
-        raise ValueError(f"Expected an .m4b input, got: {config.m4b}")
     if config.epub.suffix.lower() != ".epub":
         raise ValueError(f"Expected an .epub input, got: {config.epub}")
     ensure_command("ffprobe")
@@ -425,11 +435,12 @@ def log_run_header(
 ) -> None:
     logger.info("Starting EPUB media-overlay pipeline")
     logger.info("Run mode: %s", describe_run_mode(mode))
-    logger.info("Input M4B: %s", config.m4b)
+    logger.info("Input audio: %s", config.audio)
     logger.info("Input EPUB: %s", config.epub)
     logger.info("Transcription backend: %s", config.backend)
     logger.info("Transcription model: %s", config.model)
     logger.info("Transcription language: %s", config.language)
+    logger.info("Fixed chunk length: %ss", config.chunk_seconds)
     logger.info("Split audio codec: %s", config.audio_codec)
     if config.audio_codec == "aac":
         logger.info("Split audio bitrate: %s", config.audio_bitrate or "source default")
@@ -472,20 +483,22 @@ def build_book_info(state: dict[str, Any], paths: RuntimePaths, matched_list: li
 def refresh_working_epub(legacy: Any, book_info: dict[str, Any], run_dir: Path) -> dict[str, Any]:
     refreshed = {
         "folder_name": str(run_dir),
+        "audio_file": book_info["audio_file"],
         "audio_extension": book_info["audio_extension"],
         "audio_codec": book_info.get("audio_codec", "copy"),
         "audio_bitrate": book_info.get("audio_bitrate"),
         "audio_sample_rate": book_info.get("audio_sample_rate"),
         "audio_channels": book_info.get("audio_channels"),
+        "chunk_seconds": book_info.get("chunk_seconds", 600),
         "backend": book_info.get("backend"),
         "model": book_info.get("model"),
         "language": book_info.get("language", "en"),
     }
     with pushd(run_dir):
-        m4b_file, _source_epub, out_file, root_level = legacy.preprocess(refreshed)
+        audio_file, _source_epub, out_file, root_level = legacy.preprocess(refreshed)
     refreshed.update(
         {
-            "m4b_file": m4b_file,
+            "audio_file": audio_file,
             "epub_file": out_file,
             "out_file": out_file,
             "root_level": root_level,
@@ -494,30 +507,10 @@ def refresh_working_epub(legacy: Any, book_info: dict[str, Any], run_dir: Path) 
     return refreshed
 
 
-def expected_audio_files(book_info: dict[str, Any], run_dir: Path) -> tuple[list[str], list[dict[str, Any]]]:
-    m4b_path = run_dir / book_info["m4b_file"]
-    output = subprocess.check_output(
-        [
-            "ffprobe",
-            "-v",
-            "quiet",
-            "-i",
-            str(m4b_path),
-            "-show_chapters",
-            "-print_format",
-            "json",
-        ],
-        text=True,
-    )
-    chapters = json.loads(output).get("chapters", [])
-    names = []
-    filtered_chapters = []
-    for chapter_info in chapters:
-        if float(chapter_info["end_time"]) <= float(chapter_info["start_time"]):
-            continue
-        filtered_chapters.append(chapter_info)
-        names.append(f"{str(chapter_info['id']).zfill(3)}{book_info['audio_extension']}")
-    return names, filtered_chapters
+def expected_audio_files(legacy: Any, book_info: dict[str, Any], run_dir: Path) -> tuple[list[str], list[dict[str, Any]]]:
+    chunk_plan = legacy.plan_audio_chunks(book_info, run_dir / book_info["audio_file"])
+    names = [chunk["output_name"] for chunk in chunk_plan]
+    return names, chunk_plan
 
 
 def list_transcripts(run_dir: Path) -> list[str]:
@@ -591,27 +584,29 @@ def run_prepare_stage(
     paths.run_dir.mkdir(parents=True, exist_ok=True)
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
-    copied_m4b = paths.run_dir / config.m4b.name
+    copied_audio = paths.run_dir / config.audio.name
     copied_epub = paths.run_dir / config.epub.name
-    atomic_copy(config.m4b, copied_m4b)
+    atomic_copy(config.audio, copied_audio)
     atomic_copy(config.epub, copied_epub)
 
     book_info = {
         "folder_name": str(paths.run_dir),
+        "audio_file": copied_audio.name,
         "audio_extension": config.audio_extension,
         "audio_codec": config.audio_codec,
         "audio_bitrate": config.audio_bitrate,
         "audio_sample_rate": config.audio_sample_rate,
         "audio_channels": config.audio_channels,
+        "chunk_seconds": config.chunk_seconds,
         "backend": config.backend,
         "model": config.model,
         "language": config.language,
     }
     with pushd(paths.run_dir):
-        m4b_file, _epub_file, out_file, root_level = legacy.preprocess(book_info)
+        audio_file, _epub_file, out_file, root_level = legacy.preprocess(book_info)
     book_info.update(
         {
-            "m4b_file": m4b_file,
+            "audio_file": audio_file,
             "epub_file": out_file,
             "out_file": out_file,
             "root_level": root_level,
@@ -622,7 +617,7 @@ def run_prepare_stage(
     state["artifacts"]["prepared_epub"] = str(paths.run_dir / out_file)
     logger.info("Prepared working EPUB at %s", paths.run_dir / out_file)
     return {
-        "m4b_file": m4b_file,
+        "audio_file": audio_file,
         "source_epub": copied_epub.name,
         "out_file": out_file,
     }
@@ -636,14 +631,14 @@ def run_split_stage(
 ) -> dict[str, Any]:
     book_info = build_book_info(state, paths)
     with pushd(paths.run_dir):
-        legacy.split_m4b(book_info)
-    audio_files, chapters = expected_audio_files(book_info, paths.run_dir)
+        legacy.split_audio(book_info)
+    audio_files, chunks = expected_audio_files(legacy, book_info, paths.run_dir)
     missing = [name for name in audio_files if not (paths.run_dir / name).exists()]
     if missing:
         raise RuntimeError(f"Audio split stage did not produce all expected chunks: {missing}")
     state["artifacts"]["audio_files"] = audio_files
     logger.info("Audio split complete with %d chunk(s)", len(audio_files))
-    return {"audio_files": audio_files, "chapter_count": len(chapters)}
+    return {"audio_files": audio_files, "chunk_count": len(chunks)}
 
 
 def run_transcribe_stage(

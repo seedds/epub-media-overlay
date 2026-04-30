@@ -4,7 +4,7 @@ EPUB audiobook synchronization pipeline.
 Purpose
 -------
 
-Transform one source audiobook container (`.m4b`) and one source ebook (`.epub`)
+Transform one source audiobook file and one source ebook (`.epub`)
 into a Media Overlay-capable EPUB package.
 
 Primary responsibilities:
@@ -33,11 +33,12 @@ Pipeline overview
 -----------------
 
 1. Discover and prepare inputs.
-   `preprocess()` finds the local `.m4b` and `.epub`, copies the source EPUB to a
+   `preprocess()` finds the local audio file and `.epub`, copies the source EPUB to a
    working `.epub3`, and records OPF-related metadata in `book_info`.
 
 2. Split the audiobook into manageable chunks.
-   `split_m4b()` uses `ffprobe` chapter metadata and `ffmpeg` to create numbered
+   `split_audio()` uses `ffprobe` chapter metadata when present, otherwise it falls
+   back to fixed-duration chunks, and `ffmpeg` creates numbered
    audio files (`000.m4a`, `001.m4a`, ...). The default split mode is stream copy so
    packaged overlay audio keeps source quality unless the operator explicitly asks for
    AAC re-encoding. These chapter markers are only a starting point; later matching can
@@ -84,7 +85,7 @@ paths, pipeline settings, and intermediate artifacts between stages.
 Typical keys include:
 
 - `folder_name`: working directory for one book
-- `m4b_file`: source audiobook path/name
+- `audio_file`: source audiobook path/name
 - `epub_file`: working EPUB path/name used for matching
 - `out_file`: working `.epub3` file that gets mutated and later moved
 - `opf_file`, `opf_dir`: package metadata derived from the working EPUB
@@ -186,8 +187,17 @@ def preprocess(book_info):
     # - source `.epub` remains untouched
     # - all mutations happen against a copied `.epub3`
     # - final packaging later moves that working copy to a final `.epub`
-    m4b_file = glob.glob("*.m4b")[0]
     epub_file = glob.glob("*.epub")[0]
+    audio_file = book_info.get("audio_file")
+    if not audio_file:
+        audio_candidates = [
+            file_name
+            for file_name in glob.glob("*")
+            if os.path.isfile(file_name) and file_name != epub_file
+        ]
+        if not audio_candidates:
+            raise FileNotFoundError("No source audio file found in working directory")
+        audio_file = audio_candidates[0]
     out_file = epub_file.replace(".epub", ".epub3")
     shutil.copy(epub_file, out_file)
 
@@ -201,7 +211,67 @@ def preprocess(book_info):
     book_info["opf_dir"] = posixpath.dirname(file_name) or "."
     root_level = len(list(Path(file_name).parents))
 
-    return m4b_file, epub_file, out_file, root_level
+    return audio_file, epub_file, out_file, root_level
+
+
+def plan_audio_chunks(book_info, audio_path=None):
+    if audio_path is None:
+        audio_path = resolve_book_path(book_info, book_info["audio_file"])
+
+    audio_extension = book_info["audio_extension"]
+    output = subprocess.check_output(
+        [
+            "ffprobe",
+            "-v",
+            "quiet",
+            "-i",
+            str(audio_path),
+            "-show_chapters",
+            "-print_format",
+            "json",
+        ],
+        text=True,
+    )
+    chapters = json.loads(output).get("chapters", [])
+    chunks = []
+    for chapter_info in chapters:
+        start_time = float(chapter_info["start_time"])
+        end_time = float(chapter_info["end_time"])
+        if end_time <= start_time:
+            continue
+        chunk_id = chapter_info.get("id", len(chunks))
+        chunks.append(
+            {
+                "id": chunk_id,
+                "start_time": str(start_time),
+                "end_time": str(end_time),
+                "output_name": f"{str(chunk_id).zfill(3)}{audio_extension}",
+            }
+        )
+
+    if chunks:
+        return chunks
+
+    total_duration = get_audio_duration(str(audio_path), [])
+    chunk_seconds = int(book_info.get("chunk_seconds", 600))
+    chunk_count = int(total_duration // chunk_seconds)
+    if total_duration % chunk_seconds:
+        chunk_count += 1
+
+    for chunk_id in range(chunk_count):
+        start_time = chunk_id * chunk_seconds
+        end_time = min(total_duration, start_time + chunk_seconds)
+        if end_time <= start_time:
+            continue
+        chunks.append(
+            {
+                "id": chunk_id,
+                "start_time": str(start_time),
+                "end_time": str(end_time),
+                "output_name": f"{str(chunk_id).zfill(3)}{audio_extension}",
+            }
+        )
+    return chunks
 
 
 def delete_file_from_zip(zip_path, file_to_delete):
@@ -391,35 +461,17 @@ def get_spine_ordered_html_files(zip_file):
 # === Audio splitting and transcription ===
 
 
-def split_m4b(book_info):
+def split_audio(book_info):
     # The chapter markers embedded in the audiobook are useful for creating chunks, but
     # they are not trusted as final semantic matches to the book text. They simply give
     # us manageable audio segments for transcription and later matching. By default the
     # chunks are stream-copied so the packaged overlay keeps source audio quality.
-    output = subprocess.check_output(
-        [
-            "ffprobe",
-            "-v",
-            "quiet",
-            "-i",
-            book_info["m4b_file"],
-            "-show_chapters",
-            "-print_format",
-            "json",
-        ],
-        text=True,
-    )
-    chapters_json = json.loads(output)["chapters"]
-    valid_chapters = [
-        chapter_info
-        for chapter_info in chapters_json
-        if float(chapter_info["end_time"]) > float(chapter_info["start_time"])
-    ]
+    chunk_plan = plan_audio_chunks(book_info)
 
-    for chapter_info in tqdm(valid_chapters, desc="Splitting audio", unit="chunk"):
-        start_time = chapter_info["start_time"]
-        end_time = chapter_info["end_time"]
-        out_name = f"{str(chapter_info['id']).zfill(3)}" + book_info["audio_extension"]
+    for chunk_info in tqdm(chunk_plan, desc="Splitting audio", unit="chunk"):
+        start_time = chunk_info["start_time"]
+        end_time = chunk_info["end_time"]
+        out_name = chunk_info["output_name"]
         if os.path.exists(out_name):
             continue
 
@@ -446,7 +498,7 @@ def split_m4b(book_info):
                 "error",
                 "-nostats",
                 "-i",
-                book_info["m4b_file"],
+                book_info["audio_file"],
                 "-ss",
                 start_time,
                 "-to",
@@ -472,7 +524,7 @@ def print_nonzero_summary(label, counters):
 
 
 def transcribe_audio(book_info):
-    # Transcription is per split audio chunk, not against the original `.m4b`. The
+    # Transcription is per split audio chunk, not against the original source audio. The
     # sibling JSON files become the canonical transcript inputs for both matching and
     # fine-grained timestamp alignment.
     backend = book_info.get("backend") or detect_transcription_backend()

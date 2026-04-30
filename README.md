@@ -1,11 +1,11 @@
 # epub-media-overlay
 
-Generate a Media Overlay EPUB from an audiobook `.m4b` file and a source `.epub`.
+Generate a Media Overlay EPUB from an audiobook file and a source `.epub`.
 
 This project provides a command-line pipeline that automatically resumes prior work when possible and:
 
 - prepares a working EPUB copy
-- splits audiobook chapters into audio chunks
+- splits audiobook input into audio chunks
 - transcribes each chunk with a platform-appropriate backend
 - matches transcript chunks to EPUB HTML files
 - injects stable segment ids into HTML
@@ -40,7 +40,7 @@ Basic run:
 
 ```bash
 python generate_epub_overlay.py \
-  --m4b /path/to/book.m4b \
+  --audio /path/to/book.mp3 \
   --epub /path/to/book.epub
 ```
 
@@ -48,7 +48,7 @@ Run with all optional parameters:
 
 ```bash
 python generate_epub_overlay.py \
-  --m4b /path/to/book.m4b \
+  --audio /path/to/book.mp3 \
   --epub /path/to/book.epub \
   --output-dir /path/to/output \
   --work-dir /path/to/work \
@@ -59,6 +59,7 @@ python generate_epub_overlay.py \
   --audio-bitrate 96k \
   --audio-sample-rate 44100 \
   --audio-channels 2 \
+  --chunk-seconds 600 \
   --fresh
 ```
 
@@ -87,11 +88,11 @@ Model names depend on the selected backend. On non-MLX platforms, common values 
 
 ### Parameters
 
-`--m4b`
+`--audio`
 
 - Required.
 - Path to the source audiobook file.
-- Must point to an `.m4b` file.
+- Any audio extension is accepted as long as `ffprobe` and `ffmpeg` can read it.
 
 `--epub`
 
@@ -159,6 +160,12 @@ Model names depend on the selected backend. On non-MLX platforms, common values 
 - AAC channel count, such as `1` for mono or `2` for stereo.
 - Only valid when `--audio-codec aac` is used.
 
+`--chunk-seconds`
+
+- Optional.
+- Fixed chunk length, in seconds, used only when the source audio has no chapter metadata.
+- Default: `600`
+
 `--fresh`
 
 - Optional.
@@ -193,7 +200,8 @@ Important working artifacts:
 ## Notes
 
 - The source `.epub` is not modified directly.
-- The pipeline expects chapter metadata in the input `.m4b` for chunk generation.
+- If the source audio has chapter metadata, the pipeline splits by chapter.
+- If the source audio has no chapter metadata, the pipeline splits into fixed-size chunks.
 - Split audio defaults to stream copy so packaged playback preserves source quality.
 - Validation checks packaging, SMIL clip quality, transcript coverage, and OPF media-overlay wiring.
 - The console output and `logs/pipeline.log` include detailed stage-by-stage progress and timings.
