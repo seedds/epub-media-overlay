@@ -40,7 +40,7 @@ Basic run:
 
 ```bash
 python generate_epub_overlay.py \
-  --audio /path/to/book.mp3 \
+  --audio /path/to/book.m4b \
   --epub /path/to/book.epub
 ```
 
@@ -48,7 +48,7 @@ Run with all optional parameters:
 
 ```bash
 python generate_epub_overlay.py \
-  --audio /path/to/book.mp3 \
+  --audio /path/to/book.m4b \
   --epub /path/to/book.epub \
   --output-dir /path/to/output \
   --work-dir /path/to/work \
