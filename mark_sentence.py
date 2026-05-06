@@ -695,7 +695,11 @@ def _get_sentence_boundaries(text: str, language: str) -> List[Tuple[int, int]]:
             while k >= start and normalized_text[k].isalpha():
                 k -= 1
             word = normalized_text[k + 1 : end - 1].lower()
-            if word in abbrev_types_set:
+            # Contractions like "won't." reduce to a fake single-letter token (`t`)
+            # because the backward scan stops at the apostrophe. Do not treat those
+            # suffixes as abbreviations, but keep dotted forms such as `U.S.`.
+            preceding_char = normalized_text[k] if k >= start else ""
+            if word in abbrev_types_set and preceding_char != "'":
                 boundaries[i] = (start, next_end)
                 del boundaries[i + 1]
                 continue
@@ -1005,4 +1009,12 @@ if __name__ == "__main__":
 
     text = '"Hello," she said.'
     expected_segments = ['"Hello,"', " she said."]
+    test_your_case(text, expected_segments)
+    
+    text = 'I could regale you with tales of how we had great fun on the trip, but I won’t. I don’t feel like reliving it right now.'
+    expected_segments = [
+        'I could regale you with tales of how we had great fun on the trip, ',
+        'but I won’t. ',
+        'I don’t feel like reliving it right now.'
+    ]
     test_your_case(text, expected_segments)
