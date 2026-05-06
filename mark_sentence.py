@@ -962,6 +962,9 @@ def test_your_case(text, expected_segments):
     assert len(segments) == len(expected_segments), (
         f"Expected {len(expected_segments)} segments, got {len(segments)}"
     )
+    assert segments == expected_segments, (
+        f"Expected segments {expected_segments!r}, got {segments!r}"
+    )
 
     print("\n✅ Test PASSED!")
     return True
@@ -970,8 +973,8 @@ def test_your_case(text, expected_segments):
 if __name__ == "__main__":
     text = "the guy who passed along the tip gets a bigger allocation than normal.” The merchant tapped his fingers on the desk."
     expected_segments = [
-        "the guy who passed along the tip gets a bigger allocation than normal.”",
-        " The merchant tapped his fingers on the desk.",
+        "the guy who passed along the tip gets a bigger allocation than normal.” ",
+        "The merchant tapped his fingers on the desk.",
     ]
     test_your_case(text, expected_segments)
 
@@ -1008,7 +1011,7 @@ if __name__ == "__main__":
     test_your_case(text, expected_segments)
 
     text = '"Hello," she said.'
-    expected_segments = ['"Hello,"', " she said."]
+    expected_segments = ['"Hello," ', "she said."]
     test_your_case(text, expected_segments)
     
     text = 'I could regale you with tales of how we had great fun on the trip, but I won’t. I don’t feel like reliving it right now.'
