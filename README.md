@@ -74,6 +74,8 @@ python generate_epub_overlay.py \
 - language: `en`
 - audio extension: `.m4a`
 - split audio codec: `copy`
+- AAC split audio bitrate: `64k` when `--audio-codec aac`
+- AAC split audio sample rate: `24000` when `--audio-codec aac`
 
 With `--audio-codec copy`:
 
@@ -169,6 +171,7 @@ The `--language` setting is used for both transcription and HTML sentence segmen
 - Default: `copy`
 - `copy` preserves the source audio stream.
 - `aac` re-encodes split audio and enables the quality controls below.
+- With `--audio-codec aac`, the default bitrate is `64k` and the default sample rate is `24000` unless overridden.
 
 `--audio-bitrate`
 
