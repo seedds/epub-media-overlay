@@ -44,23 +44,32 @@ python generate_epub_overlay.py \
   --epub /path/to/book.epub
 ```
 
-Run with all optional parameters:
+Parameter template with defaults where available:
 
 ```bash
 python generate_epub_overlay.py \
   --audio /path/to/book.m4b \
   --epub /path/to/book.epub \
-  --output-dir /path/to/output \
-  --work-dir /path/to/work \
-  --model large-v2 \
+  --output-dir /path/to \
+  --work-dir /path/to/.book.epubmo \
   --language en \
   --audio-extension .m4a \
-  --audio-codec aac \
-  --audio-bitrate 96k \
-  --audio-sample-rate 44100 \
-  --audio-channels 2 \
-  --chunk-seconds 600 \
-  --fresh
+  --audio-codec copy \
+  --chunk-seconds 600
+
+# --model <default backend model>
+# small on other platforms
+# mlx-community/whisper-turbo on Apple Silicon macOS
+
+# --audio-bitrate 64k
+# --audio-sample-rate 24000
+# only valid when --audio-codec aac is used
+
+# --audio-channels <source default>
+# omit to preserve the source channel layout
+
+# --fresh
+# omit to keep the default false
 ```
 
 ### Defaults
