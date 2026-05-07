@@ -65,6 +65,7 @@ class PipelineConfig:
     audio_bitrate: str | None
     audio_sample_rate: int | None
     audio_channels: int | None
+    split_jobs: int
     chunk_seconds: int
 
 
@@ -147,6 +148,7 @@ def default_state(signature: dict[str, Any], config: PipelineConfig, paths: Runt
             "audio_bitrate": config.audio_bitrate,
             "audio_sample_rate": config.audio_sample_rate,
             "audio_channels": config.audio_channels,
+            "split_jobs": config.split_jobs,
             "chunk_seconds": config.chunk_seconds,
             "output_path": str(paths.output_path),
             "work_dir": str(paths.root),
@@ -184,6 +186,13 @@ def resolve_audio_sample_rate(audio_codec: str, audio_sample_rate: int | None) -
     if audio_codec == "aac" and audio_sample_rate is None:
         return DEFAULT_AAC_AUDIO_SAMPLE_RATE
     return audio_sample_rate
+
+
+def resolve_split_jobs(audio_codec: str, split_jobs: int | None) -> int:
+    cpu_count = os.cpu_count() or 1
+    if split_jobs is None:
+        split_jobs = max(1, cpu_count - 2) if audio_codec == "aac" else 1
+    return max(1, min(split_jobs, cpu_count))
 
 
 def stage_status(state: dict[str, Any], stage: str) -> str:
@@ -314,6 +323,14 @@ def parse_args() -> PipelineConfig:
         help="Fixed chunk length in seconds for audio files without chapters",
     )
     parser.add_argument(
+        "--split-jobs",
+        type=int,
+        help=(
+            "Parallel ffmpeg jobs used during audio splitting. Defaults to cpu_count - 2 "
+            "with --audio-codec aac and 1 with --audio-codec copy, capped at CPU count"
+        ),
+    )
+    parser.add_argument(
         "--fresh",
         action="store_true",
         help="Discard any existing working state and restart from scratch instead of resuming automatically",
@@ -335,6 +352,8 @@ def parse_args() -> PipelineConfig:
         parser.error("--audio-sample-rate must be a positive integer")
     if args.audio_channels is not None and args.audio_channels <= 0:
         parser.error("--audio-channels must be a positive integer")
+    if args.split_jobs is not None and args.split_jobs <= 0:
+        parser.error("--split-jobs must be a positive integer")
     if args.chunk_seconds <= 0:
         parser.error("--chunk-seconds must be a positive integer")
 
@@ -355,6 +374,7 @@ def parse_args() -> PipelineConfig:
     model = args.model or default_model_for_backend(backend)
     audio_bitrate = resolve_audio_bitrate(args.audio_codec, args.audio_bitrate)
     audio_sample_rate = resolve_audio_sample_rate(args.audio_codec, args.audio_sample_rate)
+    split_jobs = resolve_split_jobs(args.audio_codec, args.split_jobs)
 
     return PipelineConfig(
         audio=audio,
@@ -371,6 +391,7 @@ def parse_args() -> PipelineConfig:
         audio_bitrate=audio_bitrate,
         audio_sample_rate=audio_sample_rate,
         audio_channels=args.audio_channels,
+        split_jobs=split_jobs,
         chunk_seconds=args.chunk_seconds,
     )
 
@@ -473,6 +494,7 @@ def log_run_header(
     logger.info("Transcription language: %s", config.language)
     logger.info("Fixed chunk length: %ss", config.chunk_seconds)
     logger.info("Split audio codec: %s", config.audio_codec)
+    logger.info("Split jobs: %d (cpu count: %d)", config.split_jobs, os.cpu_count() or 1)
     if config.audio_codec == "aac":
         logger.info("Split audio bitrate: %s", config.audio_bitrate or "source default")
         logger.info(
@@ -520,6 +542,7 @@ def refresh_working_epub(legacy: Any, book_info: dict[str, Any], run_dir: Path) 
         "audio_bitrate": book_info.get("audio_bitrate"),
         "audio_sample_rate": book_info.get("audio_sample_rate"),
         "audio_channels": book_info.get("audio_channels"),
+        "split_jobs": book_info.get("split_jobs", 1),
         "chunk_seconds": book_info.get("chunk_seconds", 600),
         "backend": book_info.get("backend"),
         "model": book_info.get("model"),
@@ -572,6 +595,7 @@ def build_prepared_book_info_from_artifacts(
         "audio_bitrate": config.audio_bitrate,
         "audio_sample_rate": config.audio_sample_rate,
         "audio_channels": config.audio_channels,
+        "split_jobs": config.split_jobs,
         "chunk_seconds": config.chunk_seconds,
         "backend": config.backend,
         "model": config.model,
@@ -591,6 +615,10 @@ def ensure_prepare_state_from_artifacts(
 ) -> dict[str, Any] | None:
     existing = state.get("book_info")
     if existing:
+        if existing.get("split_jobs") != config.split_jobs:
+            existing = dict(existing)
+            existing["split_jobs"] = config.split_jobs
+            state["book_info"] = existing
         audio_path = paths.run_dir / existing.get("audio_file", "")
         working_epub_path = paths.run_dir / existing.get("out_file", "")
         copied_epub_path = paths.run_dir / config.epub.name
@@ -842,6 +870,7 @@ def run_prepare_stage(
         "audio_bitrate": config.audio_bitrate,
         "audio_sample_rate": config.audio_sample_rate,
         "audio_channels": config.audio_channels,
+        "split_jobs": config.split_jobs,
         "chunk_seconds": config.chunk_seconds,
         "backend": config.backend,
         "model": config.model,

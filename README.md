@@ -59,6 +59,7 @@ python generate_epub_overlay.py \
   --audio-bitrate 64k \
   --audio-sample-rate 24000 \
   --audio-channels 2 \
+  --split-jobs 4 \
   --chunk-seconds 600 \
   --fresh
 ```
@@ -76,6 +77,8 @@ python generate_epub_overlay.py \
 - split audio codec: `copy`
 - AAC split audio bitrate: `64k` when `--audio-codec aac`
 - AAC split audio sample rate: `24000` when `--audio-codec aac`
+- split jobs with `--audio-codec copy`: `1`
+- split jobs with `--audio-codec aac`: `max(1, cpu_count - 2)`, capped at CPU count
 
 With `--audio-codec copy`:
 
@@ -198,6 +201,15 @@ The `--language` setting is used for both transcription and HTML sentence segmen
 - Optional.
 - Fixed chunk length, in seconds, used only when the source audio has no chapter metadata.
 - Default: `600`
+
+`--split-jobs`
+
+- Optional.
+- Number of parallel `ffmpeg` jobs used during the split stage.
+- Default with `--audio-codec copy`: `1`
+- Default with `--audio-codec aac`: `max(1, cpu_count - 2)`
+- The effective value is capped at the machine CPU count.
+- Higher values may help AAC splitting, but can be slower on external drives or with `--audio-codec copy`.
 
 `--fresh`
 

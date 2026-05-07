@@ -157,6 +157,7 @@ import warnings
 import xml.dom.minidom as minidom
 import zipfile
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import redirect_stderr, redirect_stdout
 from html import escape
 from pathlib import Path
@@ -523,6 +524,59 @@ def is_audio_chunk_complete(
     return actual_duration is not None and abs(actual_duration - expected_duration) <= tolerance
 
 
+def split_audio_chunk(book_info, chunk_info):
+    start_time = chunk_info["start_time"]
+    end_time = chunk_info["end_time"]
+    out_name = chunk_info["output_name"]
+    output_path = resolve_book_path(book_info, out_name)
+    input_path = resolve_book_path(book_info, book_info["audio_file"])
+
+    audio_codec = book_info.get("audio_codec", "copy")
+    ffmpeg_audio_args = ["-c:a", "copy"]
+    if audio_codec == "aac":
+        ffmpeg_audio_args = ["-c:a", "aac"]
+        if book_info.get("audio_bitrate"):
+            ffmpeg_audio_args.extend(["-b:a", book_info["audio_bitrate"]])
+        if book_info.get("audio_sample_rate"):
+            ffmpeg_audio_args.extend(["-ar", str(book_info["audio_sample_rate"])])
+        if book_info.get("audio_channels"):
+            ffmpeg_audio_args.extend(["-ac", str(book_info["audio_channels"])])
+    elif audio_codec != "copy":
+        raise ValueError(f"Unsupported audio codec profile: {audio_codec}")
+
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-nostats",
+            "-i",
+            input_path,
+            "-ss",
+            start_time,
+            "-to",
+            end_time,
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-sn",
+            "-dn",
+            *ffmpeg_audio_args,
+            output_path,
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        error_output = (result.stderr or result.stdout or "Unknown ffmpeg error").strip()
+        raise RuntimeError(f"ffmpeg failed while creating {out_name}: {error_output}")
+    if not is_audio_chunk_complete(book_info, chunk_info):
+        raise RuntimeError(f"ffmpeg created an invalid audio chunk: {out_name}")
+
+
 def split_audio(book_info):
     # The chapter markers embedded in the audiobook are useful for creating chunks, but
     # they are not trusted as final semantic matches to the book text. They simply give
@@ -534,12 +588,10 @@ def split_audio(book_info):
         "regenerated_chunk_count": 0,
         "created_chunk_count": 0,
     }
+    pending_chunks = []
 
-    for chunk_info in tqdm(chunk_plan, desc="Splitting audio", unit="chunk"):
-        start_time = chunk_info["start_time"]
-        end_time = chunk_info["end_time"]
-        out_name = chunk_info["output_name"]
-        output_path = resolve_book_path(book_info, out_name)
+    for chunk_info in chunk_plan:
+        output_path = resolve_book_path(book_info, chunk_info["output_name"])
         if is_audio_chunk_complete(book_info, chunk_info):
             split_stats["reused_chunk_count"] += 1
             continue
@@ -547,51 +599,29 @@ def split_audio(book_info):
             split_stats["regenerated_chunk_count"] += 1
         else:
             split_stats["created_chunk_count"] += 1
+        pending_chunks.append(chunk_info)
 
-        audio_codec = book_info.get("audio_codec", "copy")
-        ffmpeg_audio_args = ["-c:a", "copy"]
-        if audio_codec == "aac":
-            ffmpeg_audio_args = ["-c:a", "aac"]
-            if book_info.get("audio_bitrate"):
-                ffmpeg_audio_args.extend(["-b:a", book_info["audio_bitrate"]])
-            if book_info.get("audio_sample_rate"):
-                ffmpeg_audio_args.extend(["-ar", str(book_info["audio_sample_rate"])])
-            if book_info.get("audio_channels"):
-                ffmpeg_audio_args.extend(["-ac", str(book_info["audio_channels"])])
-        elif audio_codec != "copy":
-            raise ValueError(f"Unsupported audio codec profile: {audio_codec}")
+    if not pending_chunks:
+        return split_stats
 
-        # Keep the console focused on overall progress. If ffmpeg fails, surface only
-        # its error output for the chunk that failed.
-        result = subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-loglevel",
-                "error",
-                "-nostats",
-                "-i",
-                book_info["audio_file"],
-                "-ss",
-                start_time,
-                "-to",
-                end_time,
-                "-map",
-                "0:a:0",
-                "-vn",
-                "-sn",
-                "-dn",
-                *ffmpeg_audio_args,
-                output_path,
-            ],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if result.returncode != 0:
-            error_output = (result.stderr or result.stdout or "Unknown ffmpeg error").strip()
-            raise RuntimeError(f"ffmpeg failed while creating {out_name}: {error_output}")
+    split_jobs = max(1, min(int(book_info.get("split_jobs", 1)), os.cpu_count() or 1))
+    if split_jobs == 1 or len(pending_chunks) == 1:
+        for chunk_info in tqdm(pending_chunks, desc="Splitting audio", unit="chunk"):
+            split_audio_chunk(book_info, chunk_info)
+        return split_stats
+
+    with ThreadPoolExecutor(max_workers=split_jobs) as executor:
+        futures = {
+            executor.submit(split_audio_chunk, book_info, chunk_info): chunk_info
+            for chunk_info in pending_chunks
+        }
+        try:
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Splitting audio", unit="chunk"):
+                future.result()
+        except Exception:
+            for future in futures:
+                future.cancel()
+            raise
     return split_stats
 
 
