@@ -467,6 +467,45 @@ def expected_chunk_duration(chunk_info):
     return max(0.0, float(chunk_info["end_time"]) - float(chunk_info["start_time"]))
 
 
+def get_primary_audio_stream_duration(audio_path):
+    try:
+        output = subprocess.check_output(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=duration",
+                "-print_format",
+                "json",
+                audio_path,
+            ],
+            text=True,
+        )
+    except Exception:
+        return None
+
+    streams = json.loads(output).get("streams", [])
+    if not streams:
+        return None
+
+    for stream in streams:
+        duration = stream.get("duration")
+        if duration is None:
+            continue
+        try:
+            parsed_duration = float(duration)
+        except (TypeError, ValueError):
+            continue
+        if parsed_duration > 0.0:
+            return parsed_duration
+
+    fallback_duration = get_audio_duration(audio_path, [])
+    return fallback_duration if fallback_duration > 0.0 else None
+
+
 def is_audio_chunk_complete(
     book_info,
     chunk_info,
@@ -480,8 +519,8 @@ def is_audio_chunk_complete(
     if expected_duration <= 0.0:
         return False
 
-    actual_duration = get_audio_duration(output_path, [])
-    return actual_duration > 0.0 and abs(actual_duration - expected_duration) <= tolerance
+    actual_duration = get_primary_audio_stream_duration(output_path)
+    return actual_duration is not None and abs(actual_duration - expected_duration) <= tolerance
 
 
 def split_audio(book_info):
@@ -537,7 +576,11 @@ def split_audio(book_info):
                 start_time,
                 "-to",
                 end_time,
+                "-map",
+                "0:a:0",
                 "-vn",
+                "-sn",
+                "-dn",
                 *ffmpeg_audio_args,
                 output_path,
             ],
