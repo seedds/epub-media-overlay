@@ -45,6 +45,8 @@ STAGES = (
 )
 
 SEGMENT_ID_RE = re.compile(r'id="c[^"]+-segment\d+"')
+DEFAULT_AAC_AUDIO_BITRATE = "64k"
+DEFAULT_AAC_AUDIO_SAMPLE_RATE = 24000
 
 
 @dataclass(frozen=True)
@@ -163,6 +165,18 @@ def save_state(paths: RuntimePaths, state: dict[str, Any]) -> None:
     atomic_write_json(paths.state_path, state)
 
 
+def resolve_audio_bitrate(audio_codec: str, audio_bitrate: str | None) -> str | None:
+    if audio_codec == "aac" and audio_bitrate is None:
+        return DEFAULT_AAC_AUDIO_BITRATE
+    return audio_bitrate
+
+
+def resolve_audio_sample_rate(audio_codec: str, audio_sample_rate: int | None) -> int | None:
+    if audio_codec == "aac" and audio_sample_rate is None:
+        return DEFAULT_AAC_AUDIO_SAMPLE_RATE
+    return audio_sample_rate
+
+
 def stage_status(state: dict[str, Any], stage: str) -> str:
     return state.get("stages", {}).get(stage, {}).get("status", "pending")
 
@@ -266,12 +280,18 @@ def parse_args() -> PipelineConfig:
     )
     parser.add_argument(
         "--audio-bitrate",
-        help="AAC bitrate for split audio chunks, such as 64k or 128k",
+        help=(
+            "AAC bitrate for split audio chunks, such as 64k or 128k. "
+            f"Defaults to {DEFAULT_AAC_AUDIO_BITRATE} with --audio-codec aac"
+        ),
     )
     parser.add_argument(
         "--audio-sample-rate",
         type=int,
-        help="AAC sample rate for split audio chunks in Hz",
+        help=(
+            "AAC sample rate for split audio chunks in Hz. "
+            f"Defaults to {DEFAULT_AAC_AUDIO_SAMPLE_RATE} with --audio-codec aac"
+        ),
     )
     parser.add_argument(
         "--audio-channels",
@@ -324,6 +344,8 @@ def parse_args() -> PipelineConfig:
     output_path = output_dir / f"{epub.stem}.media-overlay.epub"
     backend = detect_transcription_backend()
     model = args.model or default_model_for_backend(backend)
+    audio_bitrate = resolve_audio_bitrate(args.audio_codec, args.audio_bitrate)
+    audio_sample_rate = resolve_audio_sample_rate(args.audio_codec, args.audio_sample_rate)
 
     return PipelineConfig(
         audio=audio,
@@ -337,8 +359,8 @@ def parse_args() -> PipelineConfig:
         language=args.language,
         audio_extension=args.audio_extension,
         audio_codec=args.audio_codec,
-        audio_bitrate=args.audio_bitrate,
-        audio_sample_rate=args.audio_sample_rate,
+        audio_bitrate=audio_bitrate,
+        audio_sample_rate=audio_sample_rate,
         audio_channels=args.audio_channels,
         chunk_seconds=args.chunk_seconds,
     )

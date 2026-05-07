@@ -174,12 +174,14 @@ The `--language` setting is used for both transcription and HTML sentence segmen
 
 - Optional.
 - AAC bitrate for split audio chunks, such as `64k`, `96k`, or `128k`.
+- Default: `64k` when `--audio-codec aac` is used.
 - Only valid when `--audio-codec aac` is used.
 
 `--audio-sample-rate`
 
 - Optional.
 - AAC sample rate in Hz, such as `24000` or `44100`.
+- Default: `24000` when `--audio-codec aac` is used.
 - Only valid when `--audio-codec aac` is used.
 
 `--audio-channels`
