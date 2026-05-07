@@ -84,8 +84,6 @@ With `--audio-codec copy`:
 
 The `--language` setting is used for both transcription and HTML sentence segmentation.
 
-Model names depend on the selected backend. On non-MLX platforms, common values include `small`, `medium`, `large`, and `large-v2`.
-
 ### Parameters
 
 `--audio`
@@ -120,6 +118,36 @@ Model names depend on the selected backend. On non-MLX platforms, common values 
   - Apple Silicon macOS: `mlx-community/whisper-turbo`
   - other platforms: `small`
 - Valid model names depend on the active backend.
+- Common Apple Silicon macOS values:
+  - `mlx-community/whisper-tiny-mlx`
+  - `mlx-community/whisper-tiny.en-mlx`
+  - `mlx-community/whisper-base-mlx`
+  - `mlx-community/whisper-base.en-mlx`
+  - `mlx-community/whisper-small-mlx`
+  - `mlx-community/whisper-small.en-mlx`
+  - `mlx-community/whisper-medium-mlx`
+  - `mlx-community/whisper-medium.en-mlx`
+  - `mlx-community/whisper-large-mlx`
+  - `mlx-community/whisper-large-v1-mlx`
+  - `mlx-community/whisper-large-v2-mlx`
+  - `mlx-community/whisper-large-v3-mlx`
+  - `mlx-community/whisper-turbo`
+  - `mlx-community/whisper-large-v3-turbo`
+- Common values on other platforms:
+  - `tiny`
+  - `tiny.en`
+  - `base`
+  - `base.en`
+  - `small`
+  - `small.en`
+  - `medium`
+  - `medium.en`
+  - `large`
+  - `large-v1`
+  - `large-v2`
+  - `large-v3`
+  - `turbo`
+- `--model` can also point to a compatible local model path instead of one of the common identifiers above.
 
 `--language`
 
