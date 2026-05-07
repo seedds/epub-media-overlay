@@ -178,6 +178,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 os.environ["MPLBACKEND"] = "Agg"
 
+SPLIT_AUDIO_DURATION_TOLERANCE_SECONDS = 1.0
+
 
 # === EPUB and ZIP helpers ===
 
@@ -461,19 +463,51 @@ def get_spine_ordered_html_files(zip_file):
 # === Audio splitting and transcription ===
 
 
+def expected_chunk_duration(chunk_info):
+    return max(0.0, float(chunk_info["end_time"]) - float(chunk_info["start_time"]))
+
+
+def is_audio_chunk_complete(
+    book_info,
+    chunk_info,
+    tolerance=SPLIT_AUDIO_DURATION_TOLERANCE_SECONDS,
+):
+    output_path = resolve_book_path(book_info, chunk_info["output_name"])
+    if not os.path.exists(output_path):
+        return False
+
+    expected_duration = expected_chunk_duration(chunk_info)
+    if expected_duration <= 0.0:
+        return False
+
+    actual_duration = get_audio_duration(output_path, [])
+    return actual_duration > 0.0 and abs(actual_duration - expected_duration) <= tolerance
+
+
 def split_audio(book_info):
     # The chapter markers embedded in the audiobook are useful for creating chunks, but
     # they are not trusted as final semantic matches to the book text. They simply give
     # us manageable audio segments for transcription and later matching. By default the
     # chunks are stream-copied so the packaged overlay keeps source audio quality.
     chunk_plan = plan_audio_chunks(book_info)
+    split_stats = {
+        "reused_chunk_count": 0,
+        "regenerated_chunk_count": 0,
+        "created_chunk_count": 0,
+    }
 
     for chunk_info in tqdm(chunk_plan, desc="Splitting audio", unit="chunk"):
         start_time = chunk_info["start_time"]
         end_time = chunk_info["end_time"]
         out_name = chunk_info["output_name"]
-        if os.path.exists(out_name):
+        output_path = resolve_book_path(book_info, out_name)
+        if is_audio_chunk_complete(book_info, chunk_info):
+            split_stats["reused_chunk_count"] += 1
             continue
+        if os.path.exists(output_path):
+            split_stats["regenerated_chunk_count"] += 1
+        else:
+            split_stats["created_chunk_count"] += 1
 
         audio_codec = book_info.get("audio_codec", "copy")
         ffmpeg_audio_args = ["-c:a", "copy"]
@@ -505,7 +539,7 @@ def split_audio(book_info):
                 end_time,
                 "-vn",
                 *ffmpeg_audio_args,
-                os.path.join(book_info["folder_name"], out_name),
+                output_path,
             ],
             check=False,
             stdout=subprocess.PIPE,
@@ -515,6 +549,7 @@ def split_audio(book_info):
         if result.returncode != 0:
             error_output = (result.stderr or result.stdout or "Unknown ffmpeg error").strip()
             raise RuntimeError(f"ffmpeg failed while creating {out_name}: {error_output}")
+    return split_stats
 
 
 def print_nonzero_summary(label, counters):
