@@ -3,4 +3,4 @@ lxml
 nltk
 tqdm
 whisperx ; platform_system != "Darwin" or platform_machine != "arm64"
-mlx-whisperx @ git+https://github.com/seedds/mlx-whisperx.git ; platform_system == "Darwin" and platform_machine == "arm64"
+mlx-whisperx ; platform_system == "Darwin" and platform_machine == "arm64"
