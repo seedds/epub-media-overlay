@@ -47,6 +47,7 @@ STAGES = (
 SEGMENT_ID_RE = re.compile(r'id="c[^"]+-segment\d+"')
 DEFAULT_AAC_AUDIO_BITRATE = "64k"
 DEFAULT_AAC_AUDIO_SAMPLE_RATE = 24000
+DEFAULT_AAC_AUDIO_CHANNELS = 1
 
 
 @dataclass(frozen=True)
@@ -188,6 +189,12 @@ def resolve_audio_sample_rate(audio_codec: str, audio_sample_rate: int | None) -
     return audio_sample_rate
 
 
+def resolve_audio_channels(audio_codec: str, audio_channels: int | None) -> int | None:
+    if audio_codec == "aac" and audio_channels is None:
+        return DEFAULT_AAC_AUDIO_CHANNELS
+    return audio_channels
+
+
 def resolve_split_jobs(audio_codec: str, split_jobs: int | None) -> int:
     cpu_count = os.cpu_count() or 1
     if split_jobs is None:
@@ -314,7 +321,10 @@ def parse_args() -> PipelineConfig:
     parser.add_argument(
         "--audio-channels",
         type=int,
-        help="AAC channel count for split audio chunks",
+        help=(
+            "AAC channel count for split audio chunks, such as 1 for mono or 2 for stereo. "
+            f"Defaults to {DEFAULT_AAC_AUDIO_CHANNELS} with --audio-codec aac"
+        ),
     )
     parser.add_argument(
         "--chunk-seconds",
@@ -374,6 +384,7 @@ def parse_args() -> PipelineConfig:
     model = args.model or default_model_for_backend(backend)
     audio_bitrate = resolve_audio_bitrate(args.audio_codec, args.audio_bitrate)
     audio_sample_rate = resolve_audio_sample_rate(args.audio_codec, args.audio_sample_rate)
+    audio_channels = resolve_audio_channels(args.audio_codec, args.audio_channels)
     split_jobs = resolve_split_jobs(args.audio_codec, args.split_jobs)
 
     return PipelineConfig(
@@ -390,7 +401,7 @@ def parse_args() -> PipelineConfig:
         audio_codec=args.audio_codec,
         audio_bitrate=audio_bitrate,
         audio_sample_rate=audio_sample_rate,
-        audio_channels=args.audio_channels,
+        audio_channels=audio_channels,
         split_jobs=split_jobs,
         chunk_seconds=args.chunk_seconds,
     )

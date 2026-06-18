@@ -58,7 +58,7 @@ python generate_epub_overlay.py \
   --audio-codec aac \
   --audio-bitrate 64k \
   --audio-sample-rate 24000 \
-  --audio-channels 2 \
+  --audio-channels 1 \
   --split-jobs 4 \
   --chunk-seconds 600 \
   --fresh
@@ -77,6 +77,7 @@ python generate_epub_overlay.py \
 - split audio codec: `copy`
 - AAC split audio bitrate: `64k` when `--audio-codec aac`
 - AAC split audio sample rate: `24000` when `--audio-codec aac`
+- AAC split audio channels: `1` (mono) when `--audio-codec aac`
 - split jobs with `--audio-codec copy`: `1`
 - split jobs with `--audio-codec aac`: `max(1, cpu_count - 2)`, capped at CPU count
 
@@ -194,6 +195,7 @@ The `--language` setting is used for both transcription and HTML sentence segmen
 
 - Optional.
 - AAC channel count, such as `1` for mono or `2` for stereo.
+- Default: `1` (mono) when `--audio-codec aac` is used.
 - Only valid when `--audio-codec aac` is used.
 
 `--chunk-seconds`
