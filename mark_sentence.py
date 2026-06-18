@@ -674,6 +674,11 @@ def _get_sentence_boundaries(text: str, language: str) -> List[Tuple[int, int]]:
         ]
         params.abbrev_types.update(extra)
         params.abbrev_types.update(set("abcdefghijklmnopqrstuvwxyz"))
+        # Punkt's pretrained English model inherits a few abbreviations that are
+        # also ordinary words (e.g. "ill" = Illinois). In prose these are real
+        # sentence-enders, so dropping them lets Punkt split correctly. Other
+        # inherited abbreviations (Jan., Corp., Gen., ...) are kept.
+        params.abbrev_types.difference_update({"ill"})
         _TOKENIZER_CACHE[language] = (
             PunktSentenceTokenizer(params),
             params.abbrev_types,
@@ -1021,3 +1026,11 @@ if __name__ == "__main__":
         'I don’t feel like reliving it right now.'
     ]
     test_your_case(text, expected_segments)
+    
+    text = 'and Al was seriously ill. I could see that in a single glance.'
+    expected_segments = [
+        'and Al was seriously ill. ',
+        'I could see that in a single glance.'
+    ]
+    test_your_case(text, expected_segments)
+    

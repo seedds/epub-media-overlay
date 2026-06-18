@@ -180,6 +180,7 @@ os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 os.environ["MPLBACKEND"] = "Agg"
 
 SPLIT_AUDIO_DURATION_TOLERANCE_SECONDS = 1.0
+MIN_CHUNK_DURATION_SECONDS = 10.0
 
 
 # === EPUB and ZIP helpers ===
@@ -242,18 +243,37 @@ def plan_audio_chunks(book_info, audio_path=None):
         end_time = float(chapter_info["end_time"])
         if end_time <= start_time:
             continue
-        chunk_id = chapter_info.get("id", len(chunks))
-        chunks.append(
-            {
-                "id": chunk_id,
-                "start_time": str(start_time),
-                "end_time": str(end_time),
-                "output_name": f"{str(chunk_id).zfill(3)}{audio_extension}",
-            }
-        )
+        chunks.append({"start_time": start_time, "end_time": end_time})
 
     if chunks:
-        return chunks
+        # Merge chunks that are too short for reliable stream-copy splitting.
+        # Very short segments (e.g. section headers of a few seconds) can land
+        # entirely within a single AAC keyframe interval, causing ffmpeg to fail
+        # when it cannot find a clean packet boundary.  Absorbing them into a
+        # neighbour eliminates the problem at source level.
+        min_seconds = float(book_info.get("min_chunk_seconds", MIN_CHUNK_DURATION_SECONDS))
+        merged = [chunks[0]]
+        for chunk in chunks[1:]:
+            prev = merged[-1]
+            if prev["end_time"] - prev["start_time"] < min_seconds:
+                # Previous chunk is too short – extend it to cover this chunk.
+                prev["end_time"] = chunk["end_time"]
+            else:
+                merged.append(chunk)
+        # If the last chunk ended up too short, absorb it into its predecessor.
+        if len(merged) >= 2 and merged[-1]["end_time"] - merged[-1]["start_time"] < min_seconds:
+            merged[-2]["end_time"] = merged[-1]["end_time"]
+            merged.pop()
+
+        return [
+            {
+                "id": idx,
+                "start_time": str(c["start_time"]),
+                "end_time": str(c["end_time"]),
+                "output_name": f"{str(idx).zfill(3)}{audio_extension}",
+            }
+            for idx, c in enumerate(merged)
+        ]
 
     total_duration = get_audio_duration(str(audio_path), [])
     chunk_seconds = int(book_info.get("chunk_seconds", 600))
