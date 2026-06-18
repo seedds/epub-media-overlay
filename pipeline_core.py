@@ -1476,9 +1476,8 @@ def build_segment_match_list(raw_matches, segments):
 
 
 def finalize_segment_timestamps(matched_ordered_list, total_duration, anchor_start=True, anchor_end=True):
-    # This finalizer closes gaps between matched segments, optionally anchors the
-    # global chunk boundaries, and applies a small negative shift so highlights feel
-    # less late to the reader.
+    # This finalizer closes gaps between matched segments and optionally anchors the
+    # global chunk boundaries.
     matched_ordered_list = [dict(item) for item in matched_ordered_list]
 
     if matched_ordered_list:
@@ -1489,15 +1488,6 @@ def finalize_segment_timestamps(matched_ordered_list, total_duration, anchor_sta
             matched_ordered_list[0]["start"] = 0.0
         if anchor_end:
             matched_ordered_list[-1]["end"] = total_duration
-
-        for i, obj in enumerate(matched_ordered_list):
-            if i == 0:
-                obj["end"] = max(0.0, obj["end"] - 0.2)
-            elif i == len(matched_ordered_list) - 1:
-                obj["start"] = max(0.0, obj["start"] - 0.2)
-            else:
-                obj["start"] = max(0.0, obj["start"] - 0.2)
-                obj["end"] = max(0.0, obj["end"] - 0.2)
 
     return matched_ordered_list
 
