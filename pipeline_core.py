@@ -179,8 +179,22 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 os.environ["MPLBACKEND"] = "Agg"
 
+# Stream-copy chunks should match the planned span very closely, so a tight
+# tolerance is appropriate. AAC re-encoding, however, introduces encoder priming
+# delay and frame-boundary padding that make the reported stream duration drift
+# from the planned (end_time - start_time) by more than a second on some inputs.
+# Without a looser tolerance for AAC, otherwise-valid chunks are judged
+# "incomplete" and the entire split stage is needlessly re-run.
 SPLIT_AUDIO_DURATION_TOLERANCE_SECONDS = 1.0
+SPLIT_AUDIO_DURATION_TOLERANCE_SECONDS_AAC = 5.0
 MIN_CHUNK_DURATION_SECONDS = 10.0
+
+
+def split_audio_duration_tolerance(book_info):
+    """Return the chunk-duration tolerance appropriate for the configured codec."""
+    if book_info.get("audio_codec") == "aac":
+        return SPLIT_AUDIO_DURATION_TOLERANCE_SECONDS_AAC
+    return SPLIT_AUDIO_DURATION_TOLERANCE_SECONDS
 
 
 # === EPUB and ZIP helpers ===
@@ -530,8 +544,10 @@ def get_primary_audio_stream_duration(audio_path):
 def is_audio_chunk_complete(
     book_info,
     chunk_info,
-    tolerance=SPLIT_AUDIO_DURATION_TOLERANCE_SECONDS,
+    tolerance=None,
 ):
+    if tolerance is None:
+        tolerance = split_audio_duration_tolerance(book_info)
     output_path = resolve_book_path(book_info, chunk_info["output_name"])
     if not os.path.exists(output_path):
         return False

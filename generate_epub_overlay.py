@@ -57,7 +57,6 @@ class PipelineConfig:
     output_dir: Path
     output_path: Path
     work_dir: Path
-    fresh: bool
     backend: str
     model: str
     language: str
@@ -340,11 +339,6 @@ def parse_args() -> PipelineConfig:
             "with --audio-codec aac and 1 with --audio-codec copy, capped at CPU count"
         ),
     )
-    parser.add_argument(
-        "--fresh",
-        action="store_true",
-        help="Discard any existing working state and restart from scratch instead of resuming automatically",
-    )
     args = parser.parse_args()
 
     if args.audio_codec == "copy":
@@ -393,7 +387,6 @@ def parse_args() -> PipelineConfig:
         output_dir=output_dir,
         output_path=output_path,
         work_dir=work_dir,
-        fresh=args.fresh,
         backend=backend,
         model=model,
         language=args.language,
@@ -452,25 +445,46 @@ def preflight(config: PipelineConfig, logger: logging.Logger) -> None:
     ensure_nltk_resources(logger)
 
 
+def reset_derived_artifacts(paths: RuntimePaths) -> None:
+    """Remove derived downstream artifacts while preserving the expensive
+    split/transcribe outputs in run/ (audio chunks and transcript JSON).
+
+    This is used when the saved work state no longer matches the current inputs.
+    Transcription is expensive and non-deterministic, so transcripts are never
+    destroyed automatically; the stage reconcile step re-validates every artifact
+    against the current config on the next run and re-derives whatever is stale.
+    """
+    for target in (paths.matched_list_path, paths.segmented_snapshot_path, paths.validation_path):
+        if target.is_file():
+            target.unlink()
+
+    # Packaged working EPUB lives at the work-dir root as <stem>.epub.
+    for packaged in sorted(paths.root.glob("*.epub")):
+        if packaged.is_file():
+            packaged.unlink()
+
+    # SMIL files generated into the run dir.
+    if paths.run_dir.is_dir():
+        for smil_file in sorted(paths.run_dir.glob("*.smil")):
+            if smil_file.is_file():
+                smil_file.unlink()
+
+
 def initialize_state(config: PipelineConfig, paths: RuntimePaths) -> tuple[dict[str, Any], str]:
     signature = build_signature(config)
     existing_state = load_state(paths.state_path)
     mode = "new"
 
-    if config.fresh and paths.root.exists():
-        shutil.rmtree(paths.root)
-        existing_state = None
-        mode = "fresh_restart"
-
     if existing_state:
         if existing_state.get("signature") != signature:
-            shutil.rmtree(paths.root, ignore_errors=True)
+            # Inputs/config changed: drop derived downstream artifacts and reset
+            # state, but keep run/ (chunks + transcripts) intact so we never throw
+            # away expensive transcription work the user did not ask to redo.
+            reset_derived_artifacts(paths)
             existing_state = None
             mode = "signature_reset"
         else:
             mode = "resume"
-    elif config.fresh:
-        mode = "fresh_restart"
 
     paths.root.mkdir(parents=True, exist_ok=True)
     paths.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -483,10 +497,8 @@ def initialize_state(config: PipelineConfig, paths: RuntimePaths) -> tuple[dict[
 def describe_run_mode(mode: str) -> str:
     if mode == "resume":
         return "automatic resume from existing compatible work state"
-    if mode == "fresh_restart":
-        return "fresh restart requested with --fresh"
     if mode == "signature_reset":
-        return "fresh restart because the saved work state does not match the current inputs"
+        return "reset derived artifacts because the saved work state does not match the current inputs (transcripts preserved)"
     return "new run"
 
 
