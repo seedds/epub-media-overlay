@@ -673,7 +673,6 @@ def _get_sentence_boundaries(text: str, language: str) -> List[Tuple[int, int]]:
             "u.s",
         ]
         params.abbrev_types.update(extra)
-        params.abbrev_types.update(set("abcdefghijklmnopqrstuvwxyz"))
         # Punkt's pretrained English model inherits a few abbreviations that are
         # also ordinary words (e.g. "ill" = Illinois). In prose these are real
         # sentence-enders, so dropping them lets Punkt split correctly. Other
@@ -1031,6 +1030,13 @@ if __name__ == "__main__":
     expected_segments = [
         'and Al was seriously ill. ',
         'I could see that in a single glance.'
+    ]
+    test_your_case(text, expected_segments)
+    
+    text = 'but it might garner glances in a decade where shaving the back of the neck was considered a normal part of the barbering service and sideburns were reserved for rockabilly dudes like the one who had called me Daddy-O. Of course I could say I was a tourist,'
+    expected_segments = [
+        'but it might garner glances in a decade where shaving the back of the neck was considered a normal part of the barbering service and sideburns were reserved for rockabilly dudes like the one who had called me Daddy-O. ',
+        'Of course I could say I was a tourist,'
     ]
     test_your_case(text, expected_segments)
     
