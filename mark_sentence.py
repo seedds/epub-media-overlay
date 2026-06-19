@@ -1040,3 +1040,40 @@ if __name__ == "__main__":
     ]
     test_your_case(text, expected_segments)
     
+    text = "It cost 1,000 dollars, not 2,000."
+    expected_segments = [
+        "It cost 1,000 dollars, ",
+        "not 2,000.",
+    ]
+    test_your_case(text, expected_segments)
+
+    text = "At 3:45, we left."
+    expected_segments = [
+        "At 3:45, ",
+        "we left.",
+    ]
+    test_your_case(text, expected_segments)
+
+    text = "He ran (very fast) home."
+    expected_segments = [
+        "He ran ",
+        "(very fast) ",
+        "home.",
+    ]
+    test_your_case(text, expected_segments)
+
+    text = "I was going to—wait, what?"
+    expected_segments = [
+        "I was going to—",
+        "wait, ",
+        "what?",
+    ]
+    test_your_case(text, expected_segments)
+
+    text = "Really?! I can't believe it."
+    expected_segments = [
+        "Really?! ",
+        "I can't believe it.",
+    ]
+    test_your_case(text, expected_segments)
+    
