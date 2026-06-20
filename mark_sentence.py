@@ -316,6 +316,59 @@ INLINE_TAGS = {
     "button",
 }
 
+# Common sentence-starting words. Used to disambiguate a lone uppercase letter
+# followed by a period (e.g. "Socket B. He ..."). Punkt always treats such a
+# letter as an initial and never splits. When the next word is one of these
+# function words / pronouns it almost always marks a real sentence start, so we
+# force a split. When the next word is anything else (a likely surname such as
+# "Bush" in "George W. Bush") we leave it merged to protect real middle initials.
+_SENTENCE_STARTERS = frozenset(
+    {
+        "He",
+        "She",
+        "It",
+        "They",
+        "We",
+        "I",
+        "You",
+        "But",
+        "And",
+        "The",
+        "A",
+        "An",
+        "This",
+        "That",
+        "There",
+        "Then",
+        "Of",
+        "Now",
+        "So",
+        "Yet",
+        "Or",
+        "Nor",
+        "For",
+        "As",
+        "At",
+        "In",
+        "On",
+        "When",
+        "While",
+        "If",
+        "Though",
+        "Her",
+        "His",
+        "Their",
+        "Our",
+        "My",
+        "Your",
+        "What",
+        "Who",
+        "Why",
+        "How",
+        "Where",
+    }
+)
+
 # 2. GLOBAL CACHE
 _TOKENIZER_CACHE = {}
 
@@ -715,6 +768,25 @@ def _get_sentence_boundaries(text: str, language: str) -> List[Tuple[int, int]]:
                 continue
         i += 1
 
+    # Manual split pass for Punkt's lone-initial under-split. Punkt never breaks
+    # after a single uppercase letter + period ("Socket B. He ..."), treating the
+    # letter as an initial. We re-split inside each span when such a letter is
+    # followed by a known sentence-starter. A next word that is not a starter is
+    # assumed to be a surname (real middle initial like "George W. Bush") and is
+    # left merged.
+    split_boundaries = []
+    for start, end in boundaries:
+        span_text = normalized_text[start:end]
+        last_cut = 0
+        for match in re.finditer(r"(?<![A-Za-z.])[A-Z]\.\s+([A-Z]\w*)", span_text):
+            if match.group(1) not in _SENTENCE_STARTERS:
+                continue
+            cut = match.start(1)  # split right before the next sentence's first word
+            split_boundaries.append((start + last_cut, start + cut))
+            last_cut = cut
+        split_boundaries.append((start + last_cut, end))
+    boundaries = split_boundaries
+
     # Expand boundaries to include trailing whitespace.
     final_boundaries = []
     for start, end in boundaries:
@@ -1074,6 +1146,28 @@ if __name__ == "__main__":
     expected_segments = [
         "Really?! ",
         "I can't believe it.",
+    ]
+    test_your_case(text, expected_segments)
+
+    text = "he had taken off his hat and his hair stood out around his head like that of a cartoon nebbish who has just inserted Finger A in Electric Socket B. He was gesticulating at the clerk with both hands, "
+    expected_segments = [
+        "he had taken off his hat and his hair stood out around his head like that of a cartoon nebbish who has just inserted Finger A in Electric Socket B. ",
+        "He was gesticulating at the clerk with both hands, ",
+    ]
+    test_your_case(text, expected_segments)
+
+    text = "George W. Bush went home."
+    expected_segments = ["George W. Bush went home."]
+    test_your_case(text, expected_segments)
+
+    text = "I saw Mr. B. Smith arrive."
+    expected_segments = ["I saw Mr. B. Smith arrive."]
+    test_your_case(text, expected_segments)
+
+    text = "It is option A. We chose it."
+    expected_segments = [
+        "It is option A. ",
+        "We chose it.",
     ]
     test_your_case(text, expected_segments)
     
