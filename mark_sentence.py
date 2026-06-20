@@ -1171,3 +1171,9 @@ if __name__ == "__main__":
     ]
     test_your_case(text, expected_segments)
     
+    text = "he had taken off his hat and his hair stood out around his head like that of a cartoon nebbish who has just inserted Finger A in Electric Socket B. He was gesticulating at the clerk with both hands,"
+    expected_segments = [
+        "he had taken off his hat and his hair stood out around his head like that of a cartoon nebbish who has just inserted Finger A in Electric Socket B. ",
+        "He was gesticulating at the clerk with both hands,",
+    ]
+    test_your_case(text, expected_segments)
