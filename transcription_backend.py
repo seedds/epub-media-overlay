@@ -41,7 +41,15 @@ def transcribe_file(file_path: str, model: str, language: str, backend: str) -> 
 
 def _transcribe_with_mlx(file_path: str, model: str, language: str) -> dict[str, Any]:
     mlx_whisperx = importlib.import_module("mlx_whisperx")
-    return mlx_whisperx.transcribe(file_path, model=model, language=language)
+    # no_vad=True disables mlx_whisperx's voice-activity-detection segmentation.
+    # On long audiobook chunks the auto VAD can cut a speech segment mid-sentence
+    # and drop the audio for those words entirely (e.g. "jingled. Three ladies
+    # came in." was silently lost), which leaves the corresponding text spans
+    # without media-overlay timing/highlight. Feeding the audio in uniform
+    # windows instead recovers those words deterministically.
+    return mlx_whisperx.transcribe(
+        file_path, model=model, language=language, no_vad=True
+    )
 
 
 def _transcribe_with_whisperx(file_path: str, model: str, language: str) -> dict[str, Any]:
