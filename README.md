@@ -61,8 +61,7 @@ Parameter template with every CLI option shown:
   --audio-sample-rate 24000 \
   --audio-channels 1 \
   --split-jobs 4 \
-  --chunk-seconds 600 \
-  --fresh
+  --chunk-seconds 600
 ```
 
 ### Defaults
@@ -225,16 +224,10 @@ The `--language` setting is used for both transcription and HTML sentence segmen
 - The effective value is capped at the machine CPU count.
 - Higher values may help AAC splitting, but can be slower on external drives or with `--audio-codec copy`.
 
-`--fresh`
-
-- Optional.
-- Discards any existing compatible work state and restarts the pipeline from scratch.
-
 ### Run behavior
 
 - if compatible work already exists, the pipeline resumes automatically
 - if no work exists yet, the pipeline starts from the beginning
-- use `--fresh` only when you want to discard previous work and restart from scratch
 - if `--output-dir` is omitted, the final EPUB is written next to the source EPUB
 
 ## Outputs
