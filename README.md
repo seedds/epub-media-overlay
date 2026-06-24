@@ -47,9 +47,10 @@ python generate_epub_overlay.py \
 Parameter template with every CLI option shown:
 
 ```bash
-python generate_epub_overlay.py \
+  python generate_epub_overlay.py \
   --audio /path/to/book.m4b \
   --epub /path/to/book.epub \
+  --backend mlx \
   --output-dir /path/to \
   --work-dir /path/to/.book.epubmo \
   --model small \
@@ -69,8 +70,11 @@ python generate_epub_overlay.py \
 - transcription backend:
   - Apple Silicon macOS: `mlx-whisperx`
   - other platforms: `whisperx`
+- available backend overrides:
+  - `mlx`
+  - `whisperx`
 - transcription model:
-  - Apple Silicon macOS: `mlx-community/whisper-turbo`
+  - Apple Silicon macOS: `mlx-community/whisper-large-v3-mlx`
   - other platforms: `small`
 - language: `en`
 - audio extension: `.m4a`
@@ -121,7 +125,7 @@ The `--language` setting is used for both transcription and HTML sentence segmen
 - Optional.
 - Transcription model identifier.
 - Default:
-  - Apple Silicon macOS: `mlx-community/whisper-turbo`
+  - Apple Silicon macOS: `mlx-community/whisper-large-v3-mlx`
   - other platforms: `small`
 - Valid model names depend on the active backend.
 - Common Apple Silicon macOS values:
@@ -137,7 +141,6 @@ The `--language` setting is used for both transcription and HTML sentence segmen
   - `mlx-community/whisper-large-v1-mlx`
   - `mlx-community/whisper-large-v2-mlx`
   - `mlx-community/whisper-large-v3-mlx`
-  - `mlx-community/whisper-turbo`
   - `mlx-community/whisper-large-v3-turbo`
 - Common values on other platforms:
   - `tiny`
@@ -154,6 +157,15 @@ The `--language` setting is used for both transcription and HTML sentence segmen
   - `large-v3`
   - `turbo`
 - `--model` can also point to a compatible local model path instead of one of the common identifiers above.
+
+`--backend`
+
+- Optional.
+- Overrides automatic backend detection.
+- Supported values: `mlx`, `whisperx`
+- Default:
+  - Apple Silicon macOS: `mlx`
+  - other platforms: `whisperx`
 
 `--language`
 

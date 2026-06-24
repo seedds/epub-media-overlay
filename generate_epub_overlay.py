@@ -28,6 +28,7 @@ from typing import Any
 
 from mark_sentence import ensure_nltk_resources
 from transcription_backend import (
+    available_backends,
     default_model_for_backend,
     detect_transcription_backend,
     required_module_for_backend,
@@ -284,10 +285,15 @@ def parse_args() -> PipelineConfig:
         help="Working directory used for persistent state and intermediate artifacts",
     )
     parser.add_argument(
+        "--backend",
+        choices=available_backends(),
+        help="Transcription backend override. Defaults to the platform-appropriate backend.",
+    )
+    parser.add_argument(
         "--model",
         help=(
             "Transcription model identifier. Defaults to "
-            "mlx-community/whisper-turbo on Apple Silicon macOS and small elsewhere"
+            "mlx-community/whisper-large-v3-mlx on Apple Silicon macOS and small elsewhere"
         ),
     )
     parser.add_argument("--language", default="en", help="Transcription language code")
@@ -374,7 +380,7 @@ def parse_args() -> PipelineConfig:
         else output_dir / f".{epub.stem}.epubmo"
     )
     output_path = output_dir / f"{epub.stem}.media-overlay.epub"
-    backend = detect_transcription_backend()
+    backend = args.backend or detect_transcription_backend()
     model = args.model or default_model_for_backend(backend)
     audio_bitrate = resolve_audio_bitrate(args.audio_codec, args.audio_bitrate)
     audio_sample_rate = resolve_audio_sample_rate(args.audio_codec, args.audio_sample_rate)

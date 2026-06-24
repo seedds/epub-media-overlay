@@ -10,7 +10,7 @@ BACKEND_MLX = "mlx"
 BACKEND_WHISPERX = "whisperx"
 
 DEFAULT_MODEL_BY_BACKEND = {
-    BACKEND_MLX: "mlx-community/whisper-turbo",
+    BACKEND_MLX: "mlx-community/whisper-large-v3-mlx",
     BACKEND_WHISPERX: "small",
 }
 
@@ -39,16 +39,18 @@ def transcribe_file(file_path: str, model: str, language: str, backend: str) -> 
     return _transcribe_with_whisperx(file_path, model, language)
 
 
+def available_backends() -> tuple[str, ...]:
+    return (BACKEND_MLX, BACKEND_WHISPERX)
+
+
 def _transcribe_with_mlx(file_path: str, model: str, language: str) -> dict[str, Any]:
     mlx_whisperx = importlib.import_module("mlx_whisperx")
-    # no_vad=True disables mlx_whisperx's voice-activity-detection segmentation.
-    # On long audiobook chunks the auto VAD can cut a speech segment mid-sentence
-    # and drop the audio for those words entirely (e.g. "jingled. Three ladies
-    # came in." was silently lost), which leaves the corresponding text spans
-    # without media-overlay timing/highlight. Feeding the audio in uniform
-    # windows instead recovers those words deterministically.
     return mlx_whisperx.transcribe(
-        file_path, model=model, language=language, no_vad=True
+        file_path,
+        model=model,
+        language=language,
+        beam_size=2,
+        batch_size=8,
     )
 
 
