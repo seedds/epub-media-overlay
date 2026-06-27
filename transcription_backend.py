@@ -49,7 +49,7 @@ def _transcribe_with_mlx(file_path: str, model: str, language: str) -> dict[str,
         file_path,
         model=model,
         language=language,
-        beam_size=2,
+        beam_size=1,
         batch_size=8,
     )
 
