@@ -148,6 +148,7 @@ import difflib
 import glob
 import io
 import json
+import math
 import os
 import posixpath
 import re
@@ -728,8 +729,8 @@ def link_html_with_audio(book_info):
     # openings against those windows. This supports mid-file starts and multi-chunk
     # chapters.
     epub_candidates = []
-    window_size = 160
-    window_step = 80
+    window_size = MATCH_WINDOW_SIZE
+    window_step = MATCH_WINDOW_STEP
     overlap_token_min_length = 4
     overlap_threshold = 6
     combined_score_threshold = 0.35
@@ -883,19 +884,11 @@ def link_html_with_audio(book_info):
 
                         html_token_map[file_name] = token_items
 
-                        max_start = max(0, len(token_items) - window_size)
-                        window_starts = list(range(0, max_start + 1, window_step)) or [0]
-                        if window_starts[-1] != max_start:
-                            window_starts.append(max_start)
-
-                        # Overlap is required so a transcript opening can land near the
-                        # middle of a long chapter file and still score well.
-                        window_ranges = []
-                        for window_start in window_starts:
-                            window_end = min(len(token_items), window_start + window_size)
-                            if window_end - window_start < 20:
-                                continue
-                            window_ranges.append((window_start, window_end))
+                        # Overlapping windows let a transcript opening land near the
+                        # middle of a long chapter file and still score well. Short
+                        # divider/heading pages get a single full-file window so they
+                        # remain matchable (see build_match_windows).
+                        window_ranges = build_match_windows(token_items)
 
                         window_texts = [
                             " ".join(
@@ -964,8 +957,13 @@ def link_html_with_audio(book_info):
     matched_list = []
     json_files = sorted(glob.glob("*.json"))
     last_global_index = 0
+    # Spine order of the most recently accepted match. Used as a hard forward-order
+    # gate for the short-page fallback so a divider page can never be linked out of
+    # reading order.
+    last_matched_html_order = -1
     match_stats = {
         "matched_transcripts": 0,
+        "short_page_matches": 0,
         "json_skipped_short": 0,
         "json_skipped_probe": 0,
         "no_overlap": 0,
@@ -1142,9 +1140,52 @@ def link_html_with_audio(book_info):
 
                 match_stats["matched_transcripts"] += 1
                 last_global_index = span_matches[-1]["candidate_index"]
+                last_matched_html_order = max(
+                    last_matched_html_order,
+                    span_matches[-1]["html_order"],
+                )
             else:
-                match_stats["below_threshold"] += 1
-                continue
+                # Short-page fallback: the regular scorer rejects short divider/
+                # heading pages because their handful of tokens can't reach the
+                # overlap/score thresholds, even when the spoken text opens with that
+                # exact heading. Accept such a page only when its full token sequence
+                # appears as a contiguous run at the start of the transcript probe AND
+                # it does not move backward in spine order.
+                short_match = None
+                for candidate in epub_candidates:
+                    if not is_short_page_candidate(candidate):
+                        continue
+                    if candidate["html_order"] < last_matched_html_order:
+                        continue  # hard forward-order gate
+                    page_tokens = candidate["window_tokens"]
+                    if probe_contains_page_prefix(probe_tokens, page_tokens):
+                        short_match = candidate
+                        break
+
+                if short_match is None:
+                    match_stats["below_threshold"] += 1
+                    continue
+
+                span_match = {
+                    "json_file": json_file,
+                    "html_file": short_match["file_name"],
+                    "score": float(best_score),
+                    "html_order": short_match["html_order"],
+                    "window_index": short_match["window_index"],
+                    "window_start": short_match["window_start"],
+                    "window_end": short_match["window_end"],
+                    "candidate_index": short_match["global_index"],
+                    "span_index": 0,
+                    "audio_start_index": 0,
+                    "audio_end_index": len(audio_tokens) - 1,
+                }
+                matched_list.append(span_match)
+                match_stats["matched_transcripts"] += 1
+                match_stats["short_page_matches"] += 1
+                last_global_index = short_match["global_index"]
+                last_matched_html_order = max(
+                    last_matched_html_order, short_match["html_order"]
+                )
 
             # Diagnostic only: log suspicious backward jumps after accepting a match.
             if len(matched_list) >= 2:
@@ -1168,6 +1209,7 @@ def link_html_with_audio(book_info):
         [
             ("matched transcript(s)", match_stats["matched_transcripts"]),
             ("transcript-to-HTML link(s)", len(matched_list)),
+            ("short divider-page match(es)", match_stats["short_page_matches"]),
             ("additional consecutive span(s)", match_stats["continuation_spans"]),
             ("low-content transcript(s) skipped", match_stats["json_skipped_short"]),
             ("transcript(s) skipped for missing probe tokens", match_stats["json_skipped_probe"]),
@@ -1246,6 +1288,31 @@ def clean_token(text):
     if not text:
         return ""
     return re.sub(r"[^\w]", "", text.lower())
+
+
+# Hyphen-like separators that ASR engines usually treat as word boundaries.
+# A compound such as "dry-swallowed" appears as one whitespace token in the HTML
+# but WhisperX emits it as two words ("dry", "swallowed"). Splitting on these
+# before `clean_token` keeps both token streams at the same granularity so the
+# sequence aligner can match them. Apostrophes are intentionally NOT split:
+# "don't" -> "dont" already matches the single ASR word.
+_HYPHEN_SPLIT_RE = re.compile(r"[-\u2010\u2011\u2012\u2013\u2014\u2015]")
+
+
+def split_into_match_tokens(word):
+    """Split one whitespace word into one-or-more normalized alignment tokens.
+
+    Splits on hyphen/dash characters first, then normalizes each piece with
+    `clean_token`, dropping pieces that normalize to empty.
+    """
+    if not word:
+        return []
+    tokens = []
+    for piece in _HYPHEN_SPLIT_RE.split(word):
+        token = clean_token(piece)
+        if token:
+            tokens.append(token)
+    return tokens
 
 
 def sanitize_identifier(value):
@@ -1338,10 +1405,108 @@ def iter_matched_json_groups(matched_list):
 def extract_text_token_items(text):
     token_items = []
     for word in text.split():
-        token = clean_token(word)
-        if token:
+        for token in split_into_match_tokens(word):
             token_items.append({"display": word, "token": token})
     return token_items
+
+
+# Matching window tuning. The regular path builds overlapping windows of
+# MATCH_WINDOW_SIZE tokens and discards windows shorter than MATCH_WINDOW_MIN_TOKENS
+# so a transcript opening can still anchor inside a long chapter. Short divider/
+# heading pages (e.g. "PART 6 / THE GREEN CARD MAN") are shorter than that minimum
+# and would otherwise produce no candidate at all; SHORT_PAGE_MIN_TOKENS mirrors the
+# indexing gate so such pages still get a single full-file window to match against.
+MATCH_WINDOW_SIZE = 160
+MATCH_WINDOW_STEP = 80
+MATCH_WINDOW_MIN_TOKENS = 20
+SHORT_PAGE_MIN_TOKENS = 5
+# When the regular scorer fails, a short page can still be linked if (most of) its
+# token sequence appears as a contiguous run at the start of the transcript probe.
+# SHORT_PAGE_PREFIX_MAX_OFFSET tolerates a leading stray ASR token or two on the
+# probe side. SHORT_PAGE_HEADER_SKIP tolerates running-header tokens on the page
+# side (e.g. a per-page "11/22/63" head that is printed but not spoken).
+SHORT_PAGE_PREFIX_MAX_OFFSET = 2
+SHORT_PAGE_HEADER_SKIP = 2
+# A short-page match must consecutively cover at least this fraction of the page's
+# tokens (and at least SHORT_PAGE_MIN_RUN tokens) so trivial 1-2 word coincidences
+# do not trigger a match.
+SHORT_PAGE_MIN_COVER_RATIO = 0.6
+SHORT_PAGE_MIN_RUN = 3
+
+
+def build_match_windows(token_items):
+    """Build (window_start, window_end) ranges over a file's token stream.
+
+    Mirrors the regular overlapping-window logic, but guarantees a single
+    full-file window for short pages (>= SHORT_PAGE_MIN_TOKENS but too short to
+    yield a regular window). Returns [] for pages below the indexing gate.
+    """
+    token_count = len(token_items)
+    if token_count < SHORT_PAGE_MIN_TOKENS:
+        return []
+
+    max_start = max(0, token_count - MATCH_WINDOW_SIZE)
+    window_starts = list(range(0, max_start + 1, MATCH_WINDOW_STEP)) or [0]
+    if window_starts[-1] != max_start:
+        window_starts.append(max_start)
+
+    window_ranges = []
+    for window_start in window_starts:
+        window_end = min(token_count, window_start + MATCH_WINDOW_SIZE)
+        if window_end - window_start < MATCH_WINDOW_MIN_TOKENS:
+            continue
+        window_ranges.append((window_start, window_end))
+
+    # Short page: every regular window was dropped for being too short. Fall back to
+    # one window spanning the whole page so it can still be a match candidate.
+    if not window_ranges:
+        window_ranges.append((0, token_count))
+
+    return window_ranges
+
+
+def is_short_page_candidate(candidate):
+    """A candidate that represents an entire short divider/heading page."""
+    return (
+        candidate["window_start"] == 0
+        and candidate["window_end"] < MATCH_WINDOW_MIN_TOKENS
+    )
+
+
+def probe_contains_page_prefix(probe_tokens, page_tokens, max_offset=SHORT_PAGE_PREFIX_MAX_OFFSET):
+    """True if (most of) the page's heading is spoken contiguously at the probe start.
+
+    A short divider page like "11/22/63 PART 6 THE GREEN CARD MAN" carries a printed
+    running header ("11/22/63") that is not spoken, so an exact whole-page prefix
+    match would fail. This accepts a match when a contiguous suffix of the page
+    tokens (after skipping up to SHORT_PAGE_HEADER_SKIP leading header tokens) occurs
+    as a contiguous run beginning within `max_offset` tokens of the probe start, and
+    that run covers at least max(ceil(SHORT_PAGE_MIN_COVER_RATIO * len(page)),
+    SHORT_PAGE_MIN_RUN) page tokens. Comparison uses raw cleaned tokens (no length
+    filter) so short heading words like "the"/"man" still count.
+    """
+    if not page_tokens or not probe_tokens:
+        return False
+
+    min_run = max(
+        SHORT_PAGE_MIN_RUN,
+        math.ceil(SHORT_PAGE_MIN_COVER_RATIO * len(page_tokens)),
+    )
+    if min_run > len(probe_tokens):
+        return False
+
+    # Try dropping 0..SHORT_PAGE_HEADER_SKIP leading (header) tokens from the page,
+    # as long as enough page tokens remain to satisfy the minimum run.
+    max_header_skip = min(SHORT_PAGE_HEADER_SKIP, len(page_tokens) - min_run)
+    for header_skip in range(0, max_header_skip + 1):
+        run = page_tokens[header_skip:]
+        if len(run) > len(probe_tokens):
+            continue
+        last_start = min(max_offset, len(probe_tokens) - len(run))
+        for offset in range(0, last_start + 1):
+            if probe_tokens[offset : offset + len(run)] == run:
+                return True
+    return False
 
 
 def summarize_alignment(opcodes, html_offset=0, audio_offset=0):
@@ -1389,12 +1554,18 @@ def load_audio_tokens(json_file):
 
     audio_tokens = []
     for word_info in audio_data:
-        token = clean_token(word_info.get("word", ""))
-        if token and "start" in word_info and "end" in word_info:
+        word = word_info.get("word", "")
+        if "start" not in word_info or "end" not in word_info:
+            continue
+        # If ASR ever emits a single hyphenated word, split it to stay symmetric
+        # with the HTML side. Each sub-token reuses the parent word's start/end;
+        # the alignment envelope only uses min-start/max-end, so the segment span
+        # stays correct without fragile per-character time splitting.
+        for token in split_into_match_tokens(word):
             audio_tokens.append(
                 {
                     "token": token,
-                    "word": word_info["word"],
+                    "word": word,
                     "start": word_info["start"],
                     "end": word_info["end"],
                 }
@@ -1417,8 +1588,7 @@ def load_html_segments_and_tokens(zip_path, html_file):
         seg_text = seg.get_text()
         seg_id = seg.get("id")
         for word in seg_text.split():
-            token = clean_token(word)
-            if token:
+            for token in split_into_match_tokens(word):
                 html_tokens.append(
                     {"token": token, "seg_id": seg_id, "seg_index": seg_index}
                 )
@@ -1491,6 +1661,73 @@ def build_segment_match_list(raw_matches, segments):
         )
 
     return matched_ordered_list
+
+
+def fill_interior_segment_gaps(matched_ordered_list, segments):
+    # Safety net: a text segment can fail to match any audio word (e.g. a token
+    # granularity mismatch the aligner could not bridge). Without this, the segment
+    # is dropped entirely and its on-screen text gets no highlight while the
+    # neighboring segment silently absorbs its audio span.
+    #
+    # For every UNMATCHED segment that sits strictly between two matched segments
+    # (an interior gap), synthesize an entry by interpolating evenly across the
+    # gap [prev.end, next.start]. Gaps before the first or after the last matched
+    # segment are left alone: there is no reliable anchor to interpolate from.
+    # Non-positive gaps (next start <= prev end) are also left alone to avoid
+    # introducing overlapping clips.
+    if len(matched_ordered_list) < 2:
+        return list(matched_ordered_list)
+
+    seg_id_by_index = {
+        seg_index: seg.get("id") for seg_index, seg in enumerate(segments)
+    }
+    matched_by_index = {item["segment_index"]: item for item in matched_ordered_list}
+    ordered = sorted(matched_ordered_list, key=lambda item: item["segment_index"])
+
+    filled = []
+    for current, nxt in zip(ordered, ordered[1:]):
+        filled.append(current)
+
+        missing_indices = [
+            seg_index
+            for seg_index in range(current["segment_index"] + 1, nxt["segment_index"])
+            if seg_index not in matched_by_index and seg_index in seg_id_by_index
+        ]
+        if not missing_indices:
+            continue
+
+        gap_start = float(current["end"])
+        gap_end = float(nxt["start"])
+        span = gap_end - gap_start
+        # Only interpolate strictly-positive gaps. When the next matched segment
+        # starts at or before the current segment's end (a non-monotonic envelope,
+        # common right before an ellipsis where the segmenter emits punctuation-only
+        # spans), there is no room to place a placeholder. Inserting one anyway would
+        # pin the current segment's end to the placeholder instead of letting the
+        # finalizer collapse it to the next start, producing an overlapping clip.
+        # Skipping keeps the proven overlap-safe behavior: the unmatched span is
+        # dropped and the surrounding clips stay adjacent.
+        if span <= 0:
+            continue
+
+        steps = len(missing_indices) + 1
+        step = span / steps
+
+        for position, seg_index in enumerate(missing_indices, start=1):
+            point_start = gap_start + step * position
+            filled.append(
+                {
+                    "id": seg_id_by_index[seg_index],
+                    "segment_index": seg_index,
+                    "start": point_start,
+                    "end": point_start,
+                    "audio_text": "",
+                    "interpolated": True,
+                }
+            )
+
+    filled.append(ordered[-1])
+    return filled
 
 
 def finalize_segment_timestamps(matched_ordered_list, total_duration, anchor_start=True, anchor_end=True):
@@ -2637,6 +2874,11 @@ def create_smil_files(book_info, skip=True):
             if not segment_matches:
                 alignment_stats["no_segments"] += 1
                 continue
+
+            # Interpolate any interior segment the aligner could not match so its
+            # text still receives a media-overlay entry instead of being absorbed
+            # into a neighbor. Done per item, where `segments`/`segment_index` align.
+            segment_matches = fill_interior_segment_gaps(segment_matches, segments)
 
             for segment_match in segment_matches:
                 chunk_segment_matches.append(
