@@ -28,9 +28,12 @@ from typing import Any
 
 from mark_sentence import ensure_nltk_resources
 from transcription_backend import (
+    apply_mlx_cache_limit,
     available_backends,
     default_model_for_backend,
+    describe_backend_params,
     detect_transcription_backend,
+    is_mlx_backend,
     required_module_for_backend,
 )
 
@@ -49,6 +52,7 @@ SEGMENT_ID_RE = re.compile(r'id="c[^"]+-segment\d+"')
 DEFAULT_AAC_AUDIO_BITRATE = "64k"
 DEFAULT_AAC_AUDIO_SAMPLE_RATE = 24000
 DEFAULT_AAC_AUDIO_CHANNELS = 1
+DEFAULT_TRANSCRIBE_BATCH_SIZE = 4
 
 
 @dataclass(frozen=True)
@@ -68,6 +72,8 @@ class PipelineConfig:
     audio_channels: int | None
     split_jobs: int
     chunk_seconds: int
+    batch_size: int
+    mlx_cache_gb: float | None
 
 
 @dataclass(frozen=True)
@@ -151,6 +157,8 @@ def default_state(signature: dict[str, Any], config: PipelineConfig, paths: Runt
             "audio_channels": config.audio_channels,
             "split_jobs": config.split_jobs,
             "chunk_seconds": config.chunk_seconds,
+            "batch_size": config.batch_size,
+            "mlx_cache_gb": config.mlx_cache_gb,
             "output_path": str(paths.output_path),
             "work_dir": str(paths.root),
         },
@@ -231,6 +239,7 @@ def build_signature(config: PipelineConfig) -> dict[str, Any]:
         "audio_sample_rate": config.audio_sample_rate,
         "audio_channels": config.audio_channels,
         "chunk_seconds": config.chunk_seconds,
+        "batch_size": config.batch_size,
     }
 
 
@@ -345,6 +354,25 @@ def parse_args() -> PipelineConfig:
             "with --audio-codec aac and 1 with --audio-codec copy, capped at CPU count"
         ),
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_TRANSCRIBE_BATCH_SIZE,
+        help=(
+            "Number of audio windows decoded together per transcription batch. "
+            f"Defaults to {DEFAULT_TRANSCRIBE_BATCH_SIZE}. Lower values reduce peak "
+            "memory (notably GPU/unified memory on the mlx backend) at the cost of speed"
+        ),
+    )
+    parser.add_argument(
+        "--mlx-cache-gb",
+        type=float,
+        help=(
+            "Optional cap in GB for the mlx Metal buffer cache during transcription. "
+            "Limits how much freed GPU memory mlx retains across chunks. "
+            "Ignored for non-mlx backends"
+        ),
+    )
     args = parser.parse_args()
 
     if args.audio_codec == "copy":
@@ -366,6 +394,10 @@ def parse_args() -> PipelineConfig:
         parser.error("--split-jobs must be a positive integer")
     if args.chunk_seconds <= 0:
         parser.error("--chunk-seconds must be a positive integer")
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be a positive integer")
+    if args.mlx_cache_gb is not None and args.mlx_cache_gb <= 0:
+        parser.error("--mlx-cache-gb must be a positive number")
 
     audio = Path(args.audio).expanduser().resolve()
     epub = Path(args.epub).expanduser().resolve()
@@ -403,6 +435,8 @@ def parse_args() -> PipelineConfig:
         audio_channels=audio_channels,
         split_jobs=split_jobs,
         chunk_seconds=args.chunk_seconds,
+        batch_size=args.batch_size,
+        mlx_cache_gb=args.mlx_cache_gb,
     )
 
 
@@ -521,8 +555,16 @@ def log_run_header(
     logger.info("Transcription backend: %s", config.backend)
     logger.info("Transcription model: %s", config.model)
     logger.info("Transcription language: %s", config.language)
+    for name, value in describe_backend_params(config.backend, config.batch_size).items():
+        logger.info("Transcription %s: %s", name.replace("_", " "), value)
+    if is_mlx_backend(config.backend):
+        logger.info(
+            "mlx Metal cache limit: %s",
+            f"{config.mlx_cache_gb:.1f} GB" if config.mlx_cache_gb else "unbounded (default)",
+        )
     logger.info("Fixed chunk length: %ss", config.chunk_seconds)
     logger.info("Split audio codec: %s", config.audio_codec)
+    logger.info("Split audio extension: %s", config.audio_extension)
     logger.info("Split jobs: %d (cpu count: %d)", config.split_jobs, os.cpu_count() or 1)
     if config.audio_codec == "aac":
         logger.info("Split audio bitrate: %s", config.audio_bitrate or "source default")
@@ -534,8 +576,10 @@ def log_run_header(
             "Split audio channels: %s",
             config.audio_channels or "source default",
         )
+    logger.info("Output dir: %s", config.output_dir)
     logger.info("Output EPUB: %s", config.output_path)
     logger.info("Work dir: %s", paths.root)
+    logger.info("Run dir: %s", paths.run_dir)
     logger.info("Detailed log: %s", paths.logs_dir / "pipeline.log")
 
 
@@ -573,6 +617,7 @@ def refresh_working_epub(legacy: Any, book_info: dict[str, Any], run_dir: Path) 
         "audio_channels": book_info.get("audio_channels"),
         "split_jobs": book_info.get("split_jobs", 1),
         "chunk_seconds": book_info.get("chunk_seconds", 600),
+        "batch_size": book_info.get("batch_size", DEFAULT_TRANSCRIBE_BATCH_SIZE),
         "backend": book_info.get("backend"),
         "model": book_info.get("model"),
         "language": book_info.get("language", "en"),
@@ -626,6 +671,7 @@ def build_prepared_book_info_from_artifacts(
         "audio_channels": config.audio_channels,
         "split_jobs": config.split_jobs,
         "chunk_seconds": config.chunk_seconds,
+        "batch_size": config.batch_size,
         "backend": config.backend,
         "model": config.model,
         "language": config.language,
@@ -901,6 +947,7 @@ def run_prepare_stage(
         "audio_channels": config.audio_channels,
         "split_jobs": config.split_jobs,
         "chunk_seconds": config.chunk_seconds,
+        "batch_size": config.batch_size,
         "backend": config.backend,
         "model": config.model,
         "language": config.language,
@@ -970,6 +1017,11 @@ def run_transcribe_stage(
     book_info["backend"] = config.backend
     book_info["model"] = config.model
     book_info["language"] = config.language
+    book_info["batch_size"] = config.batch_size
+
+    applied_cache_gb = apply_mlx_cache_limit(config.backend, config.mlx_cache_gb)
+    if applied_cache_gb is not None:
+        logger.info("mlx Metal cache limit set to %.1f GB", applied_cache_gb)
 
     with pushd(paths.run_dir):
         legacy.transcribe_audio(book_info)

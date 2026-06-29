@@ -33,28 +33,84 @@ def required_module_for_backend(backend: str) -> str:
     return "whisperx"
 
 
-def transcribe_file(file_path: str, model: str, language: str, backend: str) -> dict[str, Any]:
+def transcribe_file(
+    file_path: str,
+    model: str,
+    language: str,
+    backend: str,
+    batch_size: int,
+) -> dict[str, Any]:
     if backend == BACKEND_MLX:
-        return _transcribe_with_mlx(file_path, model, language)
-    return _transcribe_with_whisperx(file_path, model, language)
+        return _transcribe_with_mlx(file_path, model, language, batch_size)
+    return _transcribe_with_whisperx(file_path, model, language, batch_size)
 
 
 def available_backends() -> tuple[str, ...]:
     return (BACKEND_MLX, BACKEND_WHISPERX)
 
 
-def _transcribe_with_mlx(file_path: str, model: str, language: str) -> dict[str, Any]:
+def describe_backend_params(backend: str, batch_size: int) -> dict[str, Any]:
+    if backend == BACKEND_MLX:
+        # mirrors _transcribe_with_mlx
+        return {"beam_size": 1, "batch_size": batch_size}
+    # mirrors _transcribe_with_whisperx
+    try:
+        torch = importlib.import_module("torch")
+    except ModuleNotFoundError:
+        torch = None
+    device = "cuda" if torch is not None and torch.cuda.is_available() else "cpu"
+    compute_type = "float16" if device == "cuda" else "int8"
+    return {"device": device, "compute_type": compute_type, "batch_size": batch_size}
+
+
+def is_mlx_backend(backend: str) -> bool:
+    return backend == BACKEND_MLX
+
+
+def apply_mlx_cache_limit(backend: str, cache_gb: float | None) -> float | None:
+    """Cap the mlx Metal buffer cache so freed GPU memory is not retained unbounded.
+
+    Returns the applied limit in GB, or None when nothing was applied (non-mlx
+    backend, no limit requested, or the installed mlx build lacks the setter).
+    """
+    if backend != BACKEND_MLX or cache_gb is None:
+        return None
+    try:
+        mx = importlib.import_module("mlx.core")
+    except ModuleNotFoundError:
+        return None
+    limit_bytes = int(cache_gb * 1024**3)
+    setter = getattr(mx, "set_cache_limit", None) or getattr(
+        getattr(mx, "metal", None), "set_cache_limit", None
+    )
+    if setter is None:
+        return None
+    setter(limit_bytes)
+    return cache_gb
+
+
+def _transcribe_with_mlx(
+    file_path: str,
+    model: str,
+    language: str,
+    batch_size: int,
+) -> dict[str, Any]:
     mlx_whisperx = importlib.import_module("mlx_whisperx")
     return mlx_whisperx.transcribe(
         file_path,
         model=model,
         language=language,
         beam_size=1,
-        batch_size=8,
+        batch_size=batch_size,
     )
 
 
-def _transcribe_with_whisperx(file_path: str, model: str, language: str) -> dict[str, Any]:
+def _transcribe_with_whisperx(
+    file_path: str,
+    model: str,
+    language: str,
+    batch_size: int,
+) -> dict[str, Any]:
     whisperx = importlib.import_module("whisperx")
     try:
         torch = importlib.import_module("torch")
@@ -63,7 +119,6 @@ def _transcribe_with_whisperx(file_path: str, model: str, language: str) -> dict
 
     device = "cuda" if torch is not None and torch.cuda.is_available() else "cpu"
     compute_type = "float16" if device == "cuda" else "int8"
-    batch_size = 16 if device == "cuda" else 4
 
     model_obj = whisperx.load_model(model, device, compute_type=compute_type)
     audio = whisperx.load_audio(file_path)
