@@ -766,6 +766,16 @@ def _get_sentence_boundaries(text: str, language: str) -> List[Tuple[int, int]]:
                 boundaries[i] = (start, next_end)
                 del boundaries[i + 1]
                 continue
+        # Spaced ellipsis ("she looked . . ."). Punkt treats each spaced dot as a
+        # sentence terminator and splits every "." into its own span. Re-merge a
+        # following lone dot fragment back into the preceding span. The merge-and-
+        # continue idiom collapses runs of any length (. . / . . . / . . . .).
+        cur = normalized_text[start:end].rstrip()
+        nxt = normalized_text[next_start:next_end].strip()
+        if cur.endswith(".") and nxt and all(c == "." for c in nxt):
+            boundaries[i] = (start, next_end)
+            del boundaries[i + 1]
+            continue
         i += 1
 
     # Manual split pass for Punkt's lone-initial under-split. Punkt never breaks
@@ -1177,3 +1187,15 @@ if __name__ == "__main__":
         "He was gesticulating at the clerk with both hands,",
     ]
     test_your_case(text, expected_segments)
+
+    text = "she looked at me reproachfully . . ."
+    expected_segments = ["she looked at me reproachfully . . ."]
+    test_your_case(text, expected_segments)
+
+    text = "Well . . . I suppose so."
+    expected_segments = [
+        "Well . . . ",
+        "I suppose so.",
+    ]
+    test_your_case(text, expected_segments)
+    

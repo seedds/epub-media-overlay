@@ -73,7 +73,7 @@ The tokenizer's abbreviation set is assembled from three sources:
 ### 4. Manual merge pass (`mark_sentence.py:691`)
 
 Punkt sometimes *over-splits*. After tokenizing, a manual pass walks adjacent
-boundary pairs and merges them back together in two cases:
+boundary pairs and merges them back together in three cases:
 
 - **Abbreviation**: the first span ends in `.`, and the word immediately before
   the period is in the abbreviation set. A backward scan extracts that word.
@@ -81,6 +81,13 @@ boundary pairs and merges them back together in two cases:
   apostrophe and would otherwise see a fake single-letter token `t`).
 - **Possessive**: the boundary falls right before `'` followed by a lowercase
   letter (e.g. a name's possessive).
+- **Spaced ellipsis**: the first span ends in `.`, and the *entire* next span is
+  nothing but dots once whitespace is stripped. Punkt reads a spaced ellipsis
+  (`. . .`) as several one-character "sentences", so each lone `.` would become
+  its own segment span. Merging the dot fragment back into the preceding span,
+  then re-running the loop, collapses dot runs of any length (`. .`, `. . .`,
+  `. . . .`). Contiguous ellipses (`...`, `…`) are a single Punkt token and never
+  hit this path; only the space-separated form needs repair.
 
 ### 5. Trailing whitespace
 
@@ -101,6 +108,8 @@ behaviour. Representative cases:
 | `Mr. Y.'s speech,` | Single-letter initial `Y.` must not split; needs single-letter abbreviations. |
 | `a meaningful moment in U.S. history.` | Dotted abbreviation `U.S.` stays intact. |
 | `...heard anything of you … must come...` | Ellipsis acts as a sentence break. |
+| `she looked at me reproachfully . . .` | Spaced ellipsis stays in one segment; Punkt's per-dot over-split is merged back. |
+| `Well . . . I suppose so.` | Spaced ellipsis stays with the text before it (`Well . . . `), then a real split before the next sentence. |
 | `"Hello," she said.` | Split after the closing quote + comma. |
 | `...but I won't. I don't feel...` | Contraction `won't.` is still a real sentence end (apostrophe guard). |
 | `and Al was seriously ill. I could see...` | Real sentence break after `ill.` — see below. |
