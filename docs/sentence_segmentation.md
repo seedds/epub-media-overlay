@@ -23,13 +23,13 @@ This doc focuses on the second stage: boundary detection.
 
 Boundary detection happens at two granularities and is then reconciled:
 
-1. **Sentence boundaries** — `_get_sentence_boundaries()` (`mark_sentence.py:620`).
+1. **Sentence boundaries** — `_get_sentence_boundaries()` (`mark_sentence.py:673`).
    Uses NLTK Punkt to find sentence spans across the whole text.
 2. **Phrase boundaries within a sentence** — `_get_segment_boundaries_in_sentence()`
-   (`mark_sentence.py:724`). Splits a single sentence into smaller read-aloud
+   (`mark_sentence.py:814`). Splits a single sentence into smaller read-aloud
    phrases (e.g. at commas, dashes, closing quotes).
 3. **Orchestration** — `_get_sentence_aware_segment_boundaries()`
-   (`mark_sentence.py:830`). Walks the sentence spans, splits each into phrases,
+   (`mark_sentence.py:920`). Walks the sentence spans, splits each into phrases,
    merges fragments that are too short or punctuation-only into a neighbour, and
    **fills gaps** so the returned boundaries cover the full string with no holes.
 
@@ -70,7 +70,7 @@ The tokenizer's abbreviation set is assembled from three sources:
 - **Single letters `a`–`z`**, so initials like `Mr. Y.` are not treated as
   sentence ends.
 
-### 4. Manual merge pass (`mark_sentence.py:691`)
+### 4. Manual merge pass (`mark_sentence.py:743`)
 
 Punkt sometimes *over-splits*. After tokenizing, a manual pass walks adjacent
 boundary pairs and merges them back together in three cases:
@@ -81,13 +81,17 @@ boundary pairs and merges them back together in three cases:
   apostrophe and would otherwise see a fake single-letter token `t`).
 - **Possessive**: the boundary falls right before `'` followed by a lowercase
   letter (e.g. a name's possessive).
-- **Spaced ellipsis**: the first span ends in `.`, and the *entire* next span is
-  nothing but dots once whitespace is stripped. Punkt reads a spaced ellipsis
-  (`. . .`) as several one-character "sentences", so each lone `.` would become
-  its own segment span. Merging the dot fragment back into the preceding span,
-  then re-running the loop, collapses dot runs of any length (`. .`, `. . .`,
-  `. . . .`). Contiguous ellipses (`...`, `…`) are a single Punkt token and never
-  hit this path; only the space-separated form needs repair.
+- **Spaced ellipsis**: the first span ends in `.`, and the next span is dots
+  optionally followed by closing quotes or brackets once whitespace is stripped
+  (matched by `\.+["'”’)\]]*`). Punkt reads a spaced ellipsis (`. . .`) as several
+  one-character "sentences", so each lone `.` would become its own segment span.
+  Merging the dot fragment back into the preceding span, then re-running the loop,
+  collapses dot runs of any length (`. .`, `. . .`, `. . . .`). The trailing
+  closing-punctuation allowance handles a quoted ellipsis like
+  `“...but . . .”`, where Punkt peels the final `.”` off as its own sentence;
+  without it that `.”` would survive as a lone segment. Contiguous ellipses
+  (`...`, `…`) are a single Punkt token and never hit this path; only the
+  space-separated form needs repair.
 
 ### 5. Trailing whitespace
 
@@ -106,10 +110,12 @@ behaviour. Representative cases:
 | `7:30 p.m. in Peter Main's...` | `p.m.` must not end the sentence. |
 | `searching for it—looking cool,` | Em-dash creates a phrase boundary within the sentence. |
 | `Mr. Y.'s speech,` | Single-letter initial `Y.` must not split; needs single-letter abbreviations. |
-| `a meaningful moment in U.S. history.` | Dotted abbreviation `U.S.` stays intact. |
+| `a meaningful moment in U.S. history.` | Dotted abbreviation `U.S.` stays intact (guarded by the `u.s` abbreviation). |
+| `it’s us. Electronics is gonna…` | Real sentence break after the pronoun `us.` — only the dotted `u.s` is curated, not the bare word `us`. |
 | `...heard anything of you … must come...` | Ellipsis acts as a sentence break. |
 | `she looked at me reproachfully . . .` | Spaced ellipsis stays in one segment; Punkt's per-dot over-split is merged back. |
 | `Well . . . I suppose so.` | Spaced ellipsis stays with the text before it (`Well . . . `), then a real split before the next sentence. |
+| `“My degree’s from Oklahoma, but . . .”` | Quoted spaced ellipsis: the trailing `.”` merges back into `but . . .”` instead of becoming a lone segment. |
 | `"Hello," she said.` | Split after the closing quote + comma. |
 | `...but I won't. I don't feel...` | Contraction `won't.` is still a real sentence end (apostrophe guard). |
 | `and Al was seriously ill. I could see...` | Real sentence break after `ill.` — see below. |
@@ -155,7 +161,7 @@ in tokenizer construction, not in the merge pass.
 ### Fix
 
 Drop the one inherited abbreviation that is also an ordinary English word
-(`mark_sentence.py:681`):
+(`mark_sentence.py:733`):
 
 ```python
 params.abbrev_types.difference_update({"ill"})
@@ -176,4 +182,4 @@ collision surfaces later, add it to the same `difference_update({...})` set.
   `python mark_sentence.py`.
 - **Add an abbreviation**: extend the `extra` list in `_get_sentence_boundaries()`.
 - **Remove an inherited false-positive abbreviation**: add it to the
-  `difference_update({...})` set near `mark_sentence.py:681`.
+  `difference_update({...})` set near `mark_sentence.py:733`.

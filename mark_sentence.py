@@ -722,7 +722,10 @@ def _get_sentence_boundaries(text: str, language: str) -> List[Tuple[int, int]]:
             "sgt",
             "am",
             "pm",
-            "us",
+            # Only the dotted form "u.s" guards the United States abbreviation.
+            # The bare token "us" is intentionally omitted: it collides with the
+            # common pronoun "us", which would block real sentence breaks after
+            # "...us." (e.g. "it's us. Electronics...").
             "u.s",
         ]
         params.abbrev_types.update(extra)
@@ -772,7 +775,11 @@ def _get_sentence_boundaries(text: str, language: str) -> List[Tuple[int, int]]:
         # continue idiom collapses runs of any length (. . / . . . / . . . .).
         cur = normalized_text[start:end].rstrip()
         nxt = normalized_text[next_start:next_end].strip()
-        if cur.endswith(".") and nxt and all(c == "." for c in nxt):
+        # The trailing fragment may carry closing quotes or brackets after the
+        # final dot (e.g. '.”', '."', '.)'); these still belong to the ellipsis,
+        # so accept dots followed only by closing punctuation. (Smart quotes are
+        # already folded to ASCII above; the unicode forms are kept for safety.)
+        if cur.endswith(".") and re.fullmatch(r"\.+[\"'”’)\]]*", nxt):
             boundaries[i] = (start, next_end)
             del boundaries[i + 1]
             continue
@@ -1089,6 +1096,28 @@ if __name__ == "__main__":
     expected_segments = ["“a meaningful moment in U.S. history.”"]
     test_your_case(text, expected_segments)
 
+    text = "it’s us. Electronics is gonna replace banking in Dallas by 1970."
+    expected_segments = [
+        "it’s us. ",
+        "Electronics is gonna replace banking in Dallas by 1970.",
+    ]
+    test_your_case(text, expected_segments)
+
+    text = "Give it to us. We will handle it."
+    expected_segments = [
+        "Give it to us. ",
+        "We will handle it.",
+    ]
+    test_your_case(text, expected_segments)
+
+    text = "They left the U.S. in 1970 for good."
+    expected_segments = ["They left the U.S. in 1970 for good."]
+    test_your_case(text, expected_segments)
+
+    text = "It happened in the U.S. The economy boomed."
+    expected_segments = ["It happened in the U.S. The economy boomed."]
+    test_your_case(text, expected_segments)
+
     text = "such years since I heard anything of you … must come to Soldier Island …"
     expected_segments = [
         "such years since I heard anything of you … ",
@@ -1196,6 +1225,13 @@ if __name__ == "__main__":
     expected_segments = [
         "Well . . . ",
         "I suppose so.",
+    ]
+    test_your_case(text, expected_segments)
+
+    text = "“My degree’s from Oklahoma, but . . .”"
+    expected_segments = [
+        "“My degree’s from Oklahoma, ",
+        "but . . .”",
     ]
     test_your_case(text, expected_segments)
     
