@@ -61,7 +61,9 @@ Parameter template with every CLI option shown:
   --audio-sample-rate 24000 \
   --audio-channels 1 \
   --split-jobs 4 \
-  --chunk-seconds 600
+  --chunk-seconds 600 \
+  --batch-size 1 \
+  --mlx-cache-gb 8
 ```
 
 ### Defaults
@@ -83,6 +85,7 @@ Parameter template with every CLI option shown:
 - AAC split audio channels: `1` (mono) when `--audio-codec aac`
 - split jobs with `--audio-codec copy`: `1`
 - split jobs with `--audio-codec aac`: `max(1, cpu_count - 2)`, capped at CPU count
+- transcription batch size: `1`
 
 With `--audio-codec copy`:
 
@@ -223,6 +226,20 @@ The `--language` setting is used for both transcription and HTML sentence segmen
 - Default with `--audio-codec aac`: `max(1, cpu_count - 2)`
 - The effective value is capped at the machine CPU count.
 - Higher values may help AAC splitting, but can be slower on external drives or with `--audio-codec copy`.
+
+`--batch-size`
+
+- Optional.
+- Number of audio windows decoded together per transcription batch.
+- Default: `1`
+- Higher values increase transcription speed but raise peak memory (notably GPU/unified memory on the `mlx` backend).
+
+`--mlx-cache-gb`
+
+- Optional.
+- Cap, in GB, for the `mlx` Metal buffer cache during transcription, limiting how much freed GPU memory `mlx` retains across chunks.
+- Default: unset (no cap).
+- Ignored for non-`mlx` backends.
 
 ### Run behavior
 

@@ -676,7 +676,7 @@ def transcribe_audio(book_info):
     backend = book_info.get("backend") or detect_transcription_backend()
     model = book_info.get("model") or default_model_for_backend(backend)
     language = book_info.get("language") or "en"
-    batch_size = int(book_info.get("batch_size") or 4)
+    batch_size = int(book_info.get("batch_size") or 1)
 
     for file in tqdm(
         sorted(glob.glob(f"*{book_info['audio_extension']}")),
