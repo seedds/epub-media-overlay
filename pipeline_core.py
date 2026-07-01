@@ -166,6 +166,7 @@ from pathlib import Path
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from tqdm import tqdm
 
+from epub_reference_index import build_reference_index
 from mark_sentence import mark_sentences
 from transcription_backend import (
     default_model_for_backend,
@@ -1228,6 +1229,27 @@ def link_html_with_audio(book_info):
 # === Segment marking and alignment helpers ===
 
 
+def _load_reference_sets(zip_file, book_info):
+    """Build (referenced_classes, referenced_ids) for the whole EPUB.
+
+    These drive `preprocess_remove_redundant_tags`. On any failure we return empty
+    sets, which makes the cleaner conservative (it will not remove anything rather
+    than risk deleting a referenced class/id).
+    """
+    opf_file = book_info.get("opf_file")
+    opf_dir = book_info.get("opf_dir") or "."
+    if not opf_file:
+        return frozenset(), frozenset()
+    try:
+        with zip_file.open(opf_file) as handle:
+            opf_soup = BeautifulSoup(handle.read(), "xml")
+        index = build_reference_index(zip_file, opf_soup, opf_dir)
+        return index.referenced_classes, index.referenced_ids
+    except Exception as error:
+        warnings.warn(f"Could not build EPUB reference index: {error}")
+        return frozenset(), frozenset()
+
+
 def mark_segments(book_info):
     # Segment ids belong to HTML files, not to audio files. If multiple audio chunks
     # map to the same HTML chapter, we still want one consistent set of segment ids in
@@ -1242,6 +1264,7 @@ def mark_segments(book_info):
     )
 
     with zipfile.ZipFile(book_info["out_file"], "r") as f:
+        referenced_classes, referenced_ids = _load_reference_sets(f, book_info)
         processed_html_files = set()
         for item in matched_items:
             html_file_name = item["html_file"]
@@ -1256,6 +1279,8 @@ def mark_segments(book_info):
                 html_content,
                 make_segment_prefix(html_file_name),
                 language=language,
+                referenced_classes=referenced_classes,
+                referenced_ids=referenced_ids,
             )
             soup = BeautifulSoup(processed_html, "lxml")
             head = soup.head
@@ -2491,6 +2516,65 @@ def test_overlay_without_audio(book_info):
     )
 
 
+def get_toc_like_html_files(zip_file):
+    """Return the set of spine HTML paths that are tables of contents / nav documents.
+
+    Such pages carry chapter-title text but are never narrated, so matching correctly
+    skips them and the unmatched-spine check must not flag them. Detection prefers
+    authoritative OPF signals and falls back to per-document markers:
+
+    - OPF `<guide>` reference with type "toc" (EPUB2 convention);
+    - manifest item with `properties="nav"` (EPUB3 nav document);
+    - an in-document `epub:type="toc"` attribute or a `<nav>` element.
+    """
+    toc_paths = set()
+
+    opf_file = next(
+        (name for name in zip_file.namelist() if name.endswith(".opf")),
+        None,
+    )
+    if opf_file:
+        opf_dir = posixpath.dirname(opf_file) or "."
+        try:
+            with zip_file.open(opf_file) as f:
+                opf_soup = BeautifulSoup(f.read(), "xml")
+        except (OSError, zipfile.BadZipFile):
+            opf_soup = None
+
+        if opf_soup is not None:
+            def _resolve(href):
+                return posixpath.normpath(posixpath.join(opf_dir, href))
+
+            # EPUB2 guide: <reference type="toc" href="..."/>.
+            guide = opf_soup.find("guide")
+            if guide:
+                for reference in guide.find_all("reference"):
+                    if (reference.get("type") or "").strip().lower() == "toc":
+                        href = reference.get("href")
+                        if href:
+                            toc_paths.add(_resolve(href.split("#", 1)[0]))
+
+            # EPUB3 nav document: manifest item with properties containing "nav".
+            for item in opf_soup.find_all("item"):
+                properties = (item.get("properties") or "").split()
+                href = item.get("href")
+                if href and "nav" in properties:
+                    toc_paths.add(_resolve(href))
+
+    return toc_paths
+
+
+def _html_declares_toc(soup):
+    """True if the document self-identifies as a TOC via epub:type or a <nav> element."""
+    if soup.find("nav") is not None:
+        return True
+    for element in soup.find_all(attrs={"epub:type": True}):
+        types = (element.get("epub:type") or "").split()
+        if "toc" in types or "landmarks" in types:
+            return True
+    return False
+
+
 def test_unmatched_spine_html(book_info, min_token_count=80):
     # This check looks for substantive reading-order HTML files that fall between the
     # first and last matched chapters but never received any match row. Those files are
@@ -2530,6 +2614,7 @@ def test_unmatched_spine_html(book_info, min_token_count=80):
                     skipped=True,
                 )
 
+            toc_like_files = get_toc_like_html_files(zf)
             spine_index_map = {html_file: index for index, html_file in enumerate(spine_html_files)}
             matched_set = {item["html_file"] for item in matched_items}
             matched_indices = sorted(
@@ -2552,6 +2637,11 @@ def test_unmatched_spine_html(book_info, min_token_count=80):
                 if html_file in matched_set:
                     continue
 
+                # Tables of contents / nav documents carry chapter-title text but are
+                # never narrated, so matching rightly skips them; don't flag them.
+                if html_file in toc_like_files:
+                    continue
+
                 try:
                     with zf.open(html_file) as f:
                         raw_html = f.read()
@@ -2565,6 +2655,10 @@ def test_unmatched_spine_html(book_info, min_token_count=80):
                 soup = BeautifulSoup(html_content, "lxml")
                 for script_or_style in soup(["script", "style"]):
                     script_or_style.decompose()
+
+                if _html_declares_toc(soup):
+                    continue
+
                 token_count = len(
                     extract_text_token_items(soup.get_text(separator=" ", strip=True))
                 )

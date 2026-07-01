@@ -38,11 +38,14 @@ This module uses an explicit linearize -> segment -> reconstruct pipeline instea
 Pipeline overview
 -----------------
 
-1. Pre-process vendor markup.
-   We first remove Kobo wrapper spans that are not semantically meaningful but do
-   make the DOM much noisier. This step must preserve the document structure; if we
-   drop the `<head>` or break namespaces, the downstream sync script fails later in
-   less obvious ways.
+1. Pre-process redundant markup.
+   We first remove markup and attributes that nothing in the EPUB references (see
+   `preprocess_remove_redundant_tags` and `epub_reference_index`): unreferenced
+   `class`/`id` values, now-bare wrapper spans, and empty attribute-free tags. This
+   strips vendor noise such as Kobo wrapper spans while leaving anything that CSS,
+   navigation, or scripts actually use. This step must preserve the document
+   structure; if we drop the `<head>` or break namespaces, the downstream sync script
+   fails later in less obvious ways.
 
 2. Linearize the DOM.
    For each processable block element we flatten the subtree into three parallel
@@ -373,19 +376,107 @@ _SENTENCE_STARTERS = frozenset(
 _TOKENIZER_CACHE = {}
 
 
-def preprocess_remove_kobo_spans(html_content: str) -> str:
-    """Remove Kobo spans but preserve XML structure using lxml."""
-    # Remove only the known mechanical Kobo wrapper pattern.
-    soup = BeautifulSoup(html_content, "lxml")
-    for span in soup.find_all("span"):
-        if (
-            len(span.attrs) == 3
-            and span.attrs.get("class") == ["koboSpan"]
-            and span.attrs.get("id", "").startswith("kobo")
-        ):
+# Attributes that anchor behaviour or presentation and must never be dropped when
+# trimming "unused" markup. `class`/`id` are handled explicitly against the reference
+# index; everything here is left untouched regardless.
+_PROTECTED_ATTRS = frozenset(
+    {"style", "href", "src", "role", "epub:type", "xmlns", "xml:lang", "lang"}
+)
+
+
+def _unreferenced_class_values(tag: Tag, referenced_classes: frozenset) -> List[str]:
+    """Return the tag's class values that are not referenced anywhere in the EPUB."""
+    values = tag.get("class")
+    if not values:
+        return []
+    return [value for value in values if value not in referenced_classes]
+
+
+def _id_is_unreferenced(tag: Tag, referenced_ids: frozenset) -> bool:
+    """True if the tag has an id and that id is referenced by nothing."""
+    tag_id = tag.get("id")
+    return bool(tag_id) and tag_id not in referenced_ids
+
+
+def _strip_unused_attributes(
+    soup: BeautifulSoup, referenced_classes: frozenset, referenced_ids: frozenset
+) -> None:
+    """Drop class values / ids that are provably unreferenced, keeping the element.
+
+    A `class` attribute loses only its unreferenced values; if none remain the whole
+    attribute is removed. An unreferenced `id` is removed outright. Any element that
+    carries an inline `style` keeps its attributes untouched, since a bare-looking
+    class/id may still combine with that inline styling.
+    """
+    for tag in soup.find_all(True):
+        if "style" in tag.attrs:
+            continue
+        unused = _unreferenced_class_values(tag, referenced_classes)
+        if unused:
+            remaining = [v for v in tag["class"] if v not in unused]
+            if remaining:
+                tag["class"] = remaining
+            else:
+                del tag["class"]
+        if _id_is_unreferenced(tag, referenced_ids):
+            del tag["id"]
+
+
+def _unwrap_bare_wrapper_spans(soup: BeautifulSoup) -> None:
+    """Unwrap `<span>` elements that carry no attributes, preserving their content."""
+    for span in list(soup.find_all("span")):
+        if not span.attrs:
             span.unwrap()
 
-    # CRITICAL FIX: Return the FULL document (str(soup)).
+
+def _remove_empty_attribute_free_tags(soup: BeautifulSoup) -> None:
+    """Remove tags that are empty and attribute-free, leaving structure intact.
+
+    Void tags (which are meaningful even when empty) and `<a>` (empty anchors are
+    load-bearing navigation targets) are never removed. Emptiness means no child tags
+    and no non-whitespace text.
+    """
+    for tag in list(soup.find_all(True)):
+        if tag.name in VOID_TAGS or tag.name == "a":
+            continue
+        if tag.attrs:
+            continue
+        if tag.find(True) is not None:
+            continue
+        if tag.get_text(strip=True):
+            continue
+        tag.decompose()
+
+
+def preprocess_remove_redundant_tags(
+    html_content: str,
+    referenced_classes: frozenset = frozenset(),
+    referenced_ids: frozenset = frozenset(),
+) -> str:
+    """Remove markup and attributes that are provably unreferenced by the EPUB.
+
+    The two `referenced_*` sets come from `epub_reference_index.build_reference_index`
+    and name every `class`/`id` used by any stylesheet, link/nav fragment, or script.
+    Anything not named there does nothing, so it is safe to remove without changing
+    visible text, layout, style, navigation, or scripted behaviour. With empty sets
+    (the default) only genuinely inert, attribute-free markup is touched, which keeps
+    the function usable and testable in isolation.
+
+    The passes run in order because they compose:
+
+    1. Strip unreferenced `class` values and `id`s from every element.
+    2. Unwrap `<span>`s that are now attribute-free (e.g. a former Kobo span, or a
+       span whose only class was unused), preserving their text.
+    3. Remove tags that are now empty and attribute-free (e.g. a leftover span whose
+       only content and attributes were removed), never touching void tags or `<a>`.
+    """
+    soup = BeautifulSoup(html_content, "lxml")
+
+    _strip_unused_attributes(soup, referenced_classes, referenced_ids)
+    _unwrap_bare_wrapper_spans(soup)
+    _remove_empty_attribute_free_tags(soup)
+
+    # CRITICAL: return the FULL document (str(soup)).
     # Do NOT return soup.body.encode_contents(), or you lose the <head> tag,
     # causing 'AttributeError: NoneType has no attribute append' in the sync script.
     return str(soup)
@@ -396,11 +487,15 @@ def mark_sentences(
     chapter_id: str = "chapter",
     language: str = "english",
     min_words: int = 1,
+    referenced_classes: frozenset = frozenset(),
+    referenced_ids: frozenset = frozenset(),
 ) -> str:
     """Segment content by wrapping text in segment spans. Preserves structure and void tags."""
 
-    # Stage 1: remove vendor-specific wrapper noise.
-    cleaned_html = preprocess_remove_kobo_spans(html_content)
+    # Stage 1: remove markup/attributes that nothing in the EPUB references.
+    cleaned_html = preprocess_remove_redundant_tags(
+        html_content, referenced_classes, referenced_ids
+    )
 
     # Stage 2: parse the full cleaned document.
     soup = BeautifulSoup(cleaned_html, "lxml")
@@ -791,12 +886,23 @@ def _get_sentence_boundaries(text: str, language: str) -> List[Tuple[int, int]]:
     # followed by a known sentence-starter. A next word that is not a starter is
     # assumed to be a surname (real middle initial like "George W. Bush") and is
     # left merged.
+    #
+    # The pronoun "I" is a special case: unlike letters such as "A"/"B"/"W", a lone
+    # "I." is almost always the word "I" ending a clause ("Neither did I. Some ..."),
+    # not a middle initial, so we split regardless of the following word. The one
+    # exception is when "I." is itself a name-initial ("Mr. I. Jones"), signalled by a
+    # preceding token that ends in a period; there we leave it merged.
     split_boundaries = []
     for start, end in boundaries:
         span_text = normalized_text[start:end]
         last_cut = 0
         for match in re.finditer(r"(?<![A-Za-z.])[A-Z]\.\s+([A-Z]\w*)", span_text):
-            if match.group(1) not in _SENTENCE_STARTERS:
+            next_is_starter = match.group(1) in _SENTENCE_STARTERS
+            is_pronoun_i = (
+                match.group(0)[0] == "I"
+                and not span_text[: match.start()].rstrip().endswith(".")
+            )
+            if not (next_is_starter or is_pronoun_i):
                 continue
             cut = match.start(1)  # split right before the next sentence's first word
             split_boundaries.append((start + last_cut, start + cut))
@@ -1033,205 +1139,3 @@ def validate_text_consistency(
         print(f"Length mismatch: Original={len(orig_text)}, Segmented={len(new_text)}")
 
     return False
-
-
-# === Test Function ===
-def test_your_case(text, expected_segments):
-    language = "english"
-    min_words = 1
-
-    print("-" * 50)
-    print("-" * 50)
-    print("Testing text:", repr(text))
-    print("\n--- Detected Boundaries ---")
-    boundaries = _get_sentence_aware_segment_boundaries(text, language, min_words)
-    print(boundaries)
-
-    print("\n--- Extracted Segments ---")
-    segments = [text[start:end] for start, end in boundaries]
-    for i, seg in enumerate(segments, 1):
-        print(f"Segment {i}: {repr(seg)}")
-
-    assert len(segments) == len(expected_segments), (
-        f"Expected {len(expected_segments)} segments, got {len(segments)}"
-    )
-    assert segments == expected_segments, (
-        f"Expected segments {expected_segments!r}, got {segments!r}"
-    )
-
-    print("\n✅ Test PASSED!")
-    return True
-
-
-if __name__ == "__main__":
-    text = "the guy who passed along the tip gets a bigger allocation than normal.” The merchant tapped his fingers on the desk."
-    expected_segments = [
-        "the guy who passed along the tip gets a bigger allocation than normal.” ",
-        "The merchant tapped his fingers on the desk.",
-    ]
-    test_your_case(text, expected_segments)
-
-    text = "“This is the hedgehog named Mr. Needlemouse?”"
-    expected_segments = ["“This is the hedgehog named Mr. Needlemouse?”"]
-    test_your_case(text, expected_segments)
-
-    text = "The discussion was set to begin around 7:30 p.m. in Peter Main’s hotel suite at Caesar’s Palace."
-    expected_segments = [
-        "The discussion was set to begin around 7:30 p.m. in Peter Main’s hotel suite at Caesar’s Palace."
-    ]
-    test_your_case(text, expected_segments)
-
-    text = "and in between you spend a bunch of years searching for it—looking cool,"
-    expected_segments = [
-        "and in between you spend a bunch of years searching for it—",
-        "looking cool,",
-    ]
-    test_your_case(text, expected_segments)
-
-    text = "In the middle of Mr. Y.’s speech,"
-    expected_segments = ["In the middle of Mr. Y.’s speech,"]
-    test_your_case(text, expected_segments)
-
-    text = "“a meaningful moment in U.S. history.”"
-    expected_segments = ["“a meaningful moment in U.S. history.”"]
-    test_your_case(text, expected_segments)
-
-    text = "it’s us. Electronics is gonna replace banking in Dallas by 1970."
-    expected_segments = [
-        "it’s us. ",
-        "Electronics is gonna replace banking in Dallas by 1970.",
-    ]
-    test_your_case(text, expected_segments)
-
-    text = "Give it to us. We will handle it."
-    expected_segments = [
-        "Give it to us. ",
-        "We will handle it.",
-    ]
-    test_your_case(text, expected_segments)
-
-    text = "They left the U.S. in 1970 for good."
-    expected_segments = ["They left the U.S. in 1970 for good."]
-    test_your_case(text, expected_segments)
-
-    text = "It happened in the U.S. The economy boomed."
-    expected_segments = ["It happened in the U.S. The economy boomed."]
-    test_your_case(text, expected_segments)
-
-    text = "such years since I heard anything of you … must come to Soldier Island …"
-    expected_segments = [
-        "such years since I heard anything of you … ",
-        "must come to Soldier Island …",
-    ]
-    test_your_case(text, expected_segments)
-
-    text = '"Hello," she said.'
-    expected_segments = ['"Hello," ', "she said."]
-    test_your_case(text, expected_segments)
-    
-    text = 'I could regale you with tales of how we had great fun on the trip, but I won’t. I don’t feel like reliving it right now.'
-    expected_segments = [
-        'I could regale you with tales of how we had great fun on the trip, ',
-        'but I won’t. ',
-        'I don’t feel like reliving it right now.'
-    ]
-    test_your_case(text, expected_segments)
-    
-    text = 'and Al was seriously ill. I could see that in a single glance.'
-    expected_segments = [
-        'and Al was seriously ill. ',
-        'I could see that in a single glance.'
-    ]
-    test_your_case(text, expected_segments)
-    
-    text = 'but it might garner glances in a decade where shaving the back of the neck was considered a normal part of the barbering service and sideburns were reserved for rockabilly dudes like the one who had called me Daddy-O. Of course I could say I was a tourist,'
-    expected_segments = [
-        'but it might garner glances in a decade where shaving the back of the neck was considered a normal part of the barbering service and sideburns were reserved for rockabilly dudes like the one who had called me Daddy-O. ',
-        'Of course I could say I was a tourist,'
-    ]
-    test_your_case(text, expected_segments)
-    
-    text = "It cost 1,000 dollars, not 2,000."
-    expected_segments = [
-        "It cost 1,000 dollars, ",
-        "not 2,000.",
-    ]
-    test_your_case(text, expected_segments)
-
-    text = "At 3:45, we left."
-    expected_segments = [
-        "At 3:45, ",
-        "we left.",
-    ]
-    test_your_case(text, expected_segments)
-
-    text = "He ran (very fast) home."
-    expected_segments = [
-        "He ran ",
-        "(very fast) ",
-        "home.",
-    ]
-    test_your_case(text, expected_segments)
-
-    text = "I was going to—wait, what?"
-    expected_segments = [
-        "I was going to—",
-        "wait, ",
-        "what?",
-    ]
-    test_your_case(text, expected_segments)
-
-    text = "Really?! I can't believe it."
-    expected_segments = [
-        "Really?! ",
-        "I can't believe it.",
-    ]
-    test_your_case(text, expected_segments)
-
-    text = "he had taken off his hat and his hair stood out around his head like that of a cartoon nebbish who has just inserted Finger A in Electric Socket B. He was gesticulating at the clerk with both hands, "
-    expected_segments = [
-        "he had taken off his hat and his hair stood out around his head like that of a cartoon nebbish who has just inserted Finger A in Electric Socket B. ",
-        "He was gesticulating at the clerk with both hands, ",
-    ]
-    test_your_case(text, expected_segments)
-
-    text = "George W. Bush went home."
-    expected_segments = ["George W. Bush went home."]
-    test_your_case(text, expected_segments)
-
-    text = "I saw Mr. B. Smith arrive."
-    expected_segments = ["I saw Mr. B. Smith arrive."]
-    test_your_case(text, expected_segments)
-
-    text = "It is option A. We chose it."
-    expected_segments = [
-        "It is option A. ",
-        "We chose it.",
-    ]
-    test_your_case(text, expected_segments)
-    
-    text = "he had taken off his hat and his hair stood out around his head like that of a cartoon nebbish who has just inserted Finger A in Electric Socket B. He was gesticulating at the clerk with both hands,"
-    expected_segments = [
-        "he had taken off his hat and his hair stood out around his head like that of a cartoon nebbish who has just inserted Finger A in Electric Socket B. ",
-        "He was gesticulating at the clerk with both hands,",
-    ]
-    test_your_case(text, expected_segments)
-
-    text = "she looked at me reproachfully . . ."
-    expected_segments = ["she looked at me reproachfully . . ."]
-    test_your_case(text, expected_segments)
-
-    text = "Well . . . I suppose so."
-    expected_segments = [
-        "Well . . . ",
-        "I suppose so.",
-    ]
-    test_your_case(text, expected_segments)
-
-    text = "“My degree’s from Oklahoma, but . . .”"
-    expected_segments = [
-        "“My degree’s from Oklahoma, ",
-        "but . . .”",
-    ]
-    test_your_case(text, expected_segments)
-    

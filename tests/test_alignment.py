@@ -14,12 +14,25 @@ the hyphenated HTML word ("dry-swallowed") did not match the two ASR words
 ("dry", "swallowed"), so its segment was dropped from the SMIL.
 
 Run:
-  /Users/f2pgod/Documents/spyder312/bin/python -m pytest test_alignment.py -q
+  /Users/f2pgod/Documents/spyder312/bin/python -m pytest tests/test_alignment.py -q
 or:
-  /Users/f2pgod/Documents/spyder312/bin/python test_alignment.py
+  /Users/f2pgod/Documents/spyder312/bin/python tests/test_alignment.py
 """
 
+# Bootstrap: allow running this file directly.
+# Source modules are imported by bare name below, so the repo root must be on
+# sys.path before those imports. Under pytest, pyproject's pythonpath handles this.
+import sys as _sys
+from pathlib import Path as _Path
+
+_ROOT = str(_Path(__file__).resolve().parent.parent)
+if _ROOT not in _sys.path:
+    _sys.path.insert(0, _ROOT)
+
 import difflib
+import os
+import tempfile
+import zipfile
 
 from bs4 import BeautifulSoup
 
@@ -720,25 +733,111 @@ def test_short_page_match_ignores_non_short_candidates():
     assert chosen is None
 
 
-if __name__ == "__main__":
-    import sys
+# --- TOC exemption in unmatched-spine validation ---------------------------
 
-    # Lightweight runner so the file works with or without pytest installed.
-    funcs = [
-        (name, obj)
-        for name, obj in sorted(globals().items())
-        if name.startswith("test_") and callable(obj)
-    ]
-    failures = []
-    for name, fn in funcs:
-        try:
-            fn()
-            print(f"PASS {name}")
-        except AssertionError as exc:
-            failures.append((name, exc))
-            print(f"FAIL {name}: {exc}")
-        except Exception as exc:  # noqa: BLE001
-            failures.append((name, exc))
-            print(f"ERROR {name}: {exc!r}")
-    print(f"\n{len(funcs) - len(failures)}/{len(funcs)} passed")
+
+def _page(text):
+    return f"<html><body><p>{text}</p></body></html>"
+
+
+def _write_epub(files):
+    """Write an in-memory EPUB to a temp file and return its path."""
+    handle = tempfile.NamedTemporaryFile(suffix=".epub", delete=False)
+    handle.close()
+    with zipfile.ZipFile(handle.name, "w") as zf:
+        for name, content in files.items():
+            zf.writestr(name, content)
+    return handle.name
+
+
+_LONG = "word " * 200  # comfortably above the 80-token substantive threshold
+
+
+def _three_spine_opf(guide_toc=False, mid_nav=False):
+    mid_props = ' properties="nav"' if mid_nav else ""
+    guide = (
+        '<guide><reference type="toc" href="mid.xhtml"/></guide>' if guide_toc else ""
+    )
+    return (
+        '<?xml version="1.0"?>'
+        '<package xmlns="http://www.idpf.org/2007/opf" version="3.0"><manifest>'
+        '<item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>'
+        f'<item id="mid" href="mid.xhtml" media-type="application/xhtml+xml"{mid_props}/>'
+        '<item id="c2" href="c2.xhtml" media-type="application/xhtml+xml"/>'
+        '</manifest>'
+        '<spine><itemref idref="c1"/><itemref idref="mid"/><itemref idref="c2"/></spine>'
+        f'{guide}</package>'
+    )
+
+
+def _run_unmatched_check(opf, mid_body):
+    path = _write_epub(
+        {
+            "content.opf": opf,
+            "c1.xhtml": _page(_LONG),
+            "mid.xhtml": _page(mid_body),
+            "c2.xhtml": _page(_LONG),
+        }
+    )
+    try:
+        book_info = {
+            "matched_list": [{"html_file": "c1.xhtml"}, {"html_file": "c2.xhtml"}],
+            "epub_file": path,
+            "out_file": path,
+            "folder_name": os.path.dirname(path),
+        }
+        return pc.test_unmatched_spine_html(book_info)
+    finally:
+        os.unlink(path)
+
+
+def test_toc_like_files_detected_from_guide_and_nav():
+    opf = _three_spine_opf(guide_toc=True, mid_nav=True)
+    path = _write_epub({"content.opf": opf, "mid.xhtml": _page(_LONG)})
+    try:
+        with zipfile.ZipFile(path) as zf:
+            toc_like = pc.get_toc_like_html_files(zf)
+    finally:
+        os.unlink(path)
+    assert "mid.xhtml" in toc_like
+
+
+def test_unmatched_spine_exempts_guide_toc_page():
+    result = _run_unmatched_check(_three_spine_opf(guide_toc=True), _LONG)
+    assert result["ok"] is True
+    assert result["findings"] == []
+
+
+def test_unmatched_spine_exempts_nav_property_page():
+    result = _run_unmatched_check(_three_spine_opf(mid_nav=True), _LONG)
+    assert result["ok"] is True
+    assert result["findings"] == []
+
+
+def test_unmatched_spine_exempts_in_document_nav():
+    # No OPF signal; the page self-identifies with a <nav> element.
+    body = "<nav><a href='#c1'>Chapter 1</a></nav>" + _LONG
+    result = _run_unmatched_check(_three_spine_opf(), body)
+    assert result["ok"] is True
+
+
+def test_unmatched_spine_still_flags_real_missing_chapter():
+    # Substantive, unmatched, and NOT a TOC/nav -> must still be reported.
+    result = _run_unmatched_check(_three_spine_opf(), _LONG)
+    assert result["ok"] is False
+    assert [f["html_file"] for f in result["findings"]] == ["mid.xhtml"]
+
+
+def test_html_declares_toc_helper():
+    assert pc._html_declares_toc(BeautifulSoup("<nav>x</nav>", "lxml"))
+    assert pc._html_declares_toc(
+        BeautifulSoup('<div epub:type="toc">x</div>', "lxml")
+    )
+    assert not pc._html_declares_toc(BeautifulSoup("<p>plain</p>", "lxml"))
+
+
+if __name__ == "__main__":
+    from _runner import run_module_tests
+
+    raise SystemExit(run_module_tests(globals()))
     sys.exit(1 if failures else 0)

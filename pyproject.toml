@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+# Tests live in tests/ but import the source modules by their bare names
+# (e.g. `import pipeline_core`). The project is a flat set of modules, not an
+# installed package, so put the repo root on sys.path for collection.
+pythonpath = ["."]
+testpaths = ["tests"]
