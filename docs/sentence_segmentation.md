@@ -23,13 +23,13 @@ This doc focuses on the second stage: boundary detection.
 
 Boundary detection happens at two granularities and is then reconciled:
 
-1. **Sentence boundaries** — `_get_sentence_boundaries()` (`mark_sentence.py:673`).
+1. **Sentence boundaries** — `_get_sentence_boundaries()` (`mark_sentence.py:768`).
    Uses NLTK Punkt to find sentence spans across the whole text.
 2. **Phrase boundaries within a sentence** — `_get_segment_boundaries_in_sentence()`
-   (`mark_sentence.py:814`). Splits a single sentence into smaller read-aloud
+   (`mark_sentence.py:923`). Splits a single sentence into smaller read-aloud
    phrases (e.g. at commas, dashes, closing quotes).
 3. **Orchestration** — `_get_sentence_aware_segment_boundaries()`
-   (`mark_sentence.py:920`). Walks the sentence spans, splits each into phrases,
+   (`mark_sentence.py:1029`). Walks the sentence spans, splits each into phrases,
    merges fragments that are too short or punctuation-only into a neighbour, and
    **fills gaps** so the returned boundaries cover the full string with no holes.
 
@@ -70,7 +70,7 @@ The tokenizer's abbreviation set is assembled from three sources:
 - **Single letters `a`–`z`**, so initials like `Mr. Y.` are not treated as
   sentence ends.
 
-### 4. Manual merge pass (`mark_sentence.py:743`)
+### 4. Manual merge pass (`mark_sentence.py:841`)
 
 Punkt sometimes *over-splits*. After tokenizing, a manual pass walks adjacent
 boundary pairs and merges them back together in three cases:
@@ -100,7 +100,7 @@ follows a sentence travels with that sentence rather than starting the next one.
 
 ## Known edge cases
 
-The inline `test_your_case` assertions in `__main__` lock in the intended
+The parametrized cases in `tests/test_segmentation.py` lock in the intended
 behaviour. Representative cases:
 
 | Input (abbreviated) | Why it's handled specially |
@@ -119,15 +119,17 @@ behaviour. Representative cases:
 | `"Hello," she said.` | Split after the closing quote + comma. |
 | `...but I won't. I don't feel...` | Contraction `won't.` is still a real sentence end (apostrophe guard). |
 | `and Al was seriously ill. I could see...` | Real sentence break after `ill.` — see below. |
+| `Neither did I. Some silences...` | A lone pronoun `I.` ends a sentence, so it splits even when the next word is not a known sentence-starter. |
+| `I saw Mr. I. Jones today.` | A lone `I.` preceded by a title/initial (`Mr.`) is a real middle initial and stays merged. |
 
 Run the assertions with:
 
 ```
-python mark_sentence.py
+python -m pytest tests/test_segmentation.py
 ```
 
-Each case prints its detected boundaries and segments, then asserts the expected
-split. A failure raises `AssertionError` naming the mismatch.
+Each `(text, expected_segments)` pair is a parametrized case that asserts the
+expected split; a failure reports the mismatch for that specific input.
 
 ## The `ill` fix (debug writeup)
 
@@ -161,7 +163,7 @@ in tokenizer construction, not in the merge pass.
 ### Fix
 
 Drop the one inherited abbreviation that is also an ordinary English word
-(`mark_sentence.py:733`):
+(`mark_sentence.py:831`):
 
 ```python
 params.abbrev_types.difference_update({"ill"})
@@ -177,9 +179,9 @@ collision surfaces later, add it to the same `difference_update({...})` set.
 
 ## How to extend
 
-- **Add a regression case**: append a `text` / `expected_segments` pair and a
-  `test_your_case(...)` call in the `__main__` block, then run
-  `python mark_sentence.py`.
+- **Add a regression case**: append a `(text, expected_segments)` tuple to the
+  `CASES` list in `tests/test_segmentation.py`, then run
+  `python -m pytest tests/test_segmentation.py`.
 - **Add an abbreviation**: extend the `extra` list in `_get_sentence_boundaries()`.
 - **Remove an inherited false-positive abbreviation**: add it to the
-  `difference_update({...})` set near `mark_sentence.py:733`.
+  `difference_update({...})` set near `mark_sentence.py:831`.

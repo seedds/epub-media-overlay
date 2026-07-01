@@ -263,6 +263,7 @@ Important working artifacts:
 - `generate_epub_overlay.py`: CLI wrapper and state manager with automatic resume
 - `pipeline_core.py`: EPUB/audio matching, SMIL generation, packaging, and validation logic
 - `mark_sentence.py`: HTML segmentation logic used for overlay targets
+- `epub_reference_index.py`: builds the set of referenced `class`/`id` names so tag cleanup only removes provably-unused markup
 - `transcription_backend.py`: platform-aware transcription backend selection and adapters
 
 ## Troubleshooting

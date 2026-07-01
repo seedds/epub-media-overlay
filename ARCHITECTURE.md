@@ -33,8 +33,9 @@ Two pieces of shared context recur everywhere:
 | `generate_epub_overlay.py` | CLI entry, config, `state.json` + resume, stage orchestration |
 | `pipeline_core.py` | Core engine: split, transcribe, match, segment, SMIL, package, validate |
 | `mark_sentence.py` | XHTML linearize → segment → reconstruct; NLTK tokenizer setup |
+| `epub_reference_index.py` | Whole-EPUB `class`/`id` reference index that guides safe tag cleanup |
 | `transcription_backend.py` | Platform-aware backend selection (mlx / whisperx) + adapters |
-| `test_alignment.py` | Pytest suite: token splitting, alignment/gap-fill, overlap, short-page matching |
+| `tests/` | Pytest suite (see [Tests](#tests)); each file also self-runs without pytest |
 | `requirements.txt` | Dependencies (platform-gated `whisperx` vs `mlx-whisperx`) |
 | `docs/sentence_segmentation.md` | Deep dive on sentence/segment boundary detection |
 | `run.py` | Local batch runner over a folder tree. **Gitignored**, not shipped |
@@ -316,9 +317,18 @@ tolerance, header-skip, minimum coverage, minimum contiguous run).
 
 ## Tests
 
-`test_alignment.py` is a pytest suite covering token splitting (hyphens,
-apostrophes, unicode dashes, abbreviations), segment alignment and interior gap
-interpolation, overlap avoidance, and short-page / page-prefix matching. Run:
+Tests live in `tests/` and run under pytest (configured via `pyproject.toml`,
+which puts the repo root on `sys.path` so the flat source modules import by bare
+name). Each file also self-runs without pytest (e.g. `python tests/test_segmentation.py`).
+
+| File | Covers |
+| --- | --- |
+| `tests/test_alignment.py` | Token splitting (hyphens, apostrophes, unicode dashes, abbreviations), segment alignment and interior gap interpolation, overlap avoidance, short-page / page-prefix matching |
+| `tests/test_segmentation.py` | Sentence/phrase boundary detection (`mark_sentence`), as parametrized `(text, expected_segments)` cases |
+| `tests/test_html_cleaner.py` | `preprocess_remove_redundant_tags`: unreferenced class/id stripping, bare-span unwrap, empty-tag removal, safety controls |
+| `tests/test_epub_reference_index.py` | `epub_reference_index`: CSS/link/JS reference extraction; optional integration test against a real EPUB |
+
+Run the whole suite:
 
 ```bash
 pytest
