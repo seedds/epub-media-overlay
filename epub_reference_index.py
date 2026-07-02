@@ -133,12 +133,29 @@ def _collect_css_tokens(css_text, classes, ids):
     except Exception:
         return
 
+    _collect_rule_list_tokens(rules, classes, ids)
+
+
+def _collect_rule_list_tokens(rules, classes, ids):
+    """Collect selector tokens from a list of tinycss2 rules.
+
+    Recurses into conditional group at-rules (`@media`, `@supports`, etc.) so that
+    selectors styled only inside a conditional block still contribute references.
+    Otherwise a class used solely in `@media screen { .highlight { ... } }` would be
+    absent from the index and later stripped from the book.
+    """
     for rule in rules:
-        if rule.type != "qualified-rule":
-            continue
-        if not _rule_has_meaningful_declaration(rule):
-            continue
-        _collect_selector_tokens(rule.prelude, classes, ids)
+        if rule.type == "qualified-rule":
+            if _rule_has_meaningful_declaration(rule):
+                _collect_selector_tokens(rule.prelude, classes, ids)
+        elif rule.type == "at-rule" and rule.content is not None:
+            try:
+                nested = tinycss2.parse_rule_list(
+                    rule.content, skip_whitespace=True, skip_comments=True
+                )
+            except Exception:
+                continue
+            _collect_rule_list_tokens(nested, classes, ids)
 
 
 def _rule_has_meaningful_declaration(rule):
@@ -206,6 +223,31 @@ def _collect_js_tokens(js_text, classes, ids):
         ids.add(token)
 
 
+# Attributes whose value is a (possibly space-separated) list of *bare* element ids,
+# with no leading `#`. These are how accessibility relationships and table headers
+# reference ids, so the ids they name must be treated as referenced or the attribute
+# stripper leaves dangling references (aria-labelledby -> deleted id, etc.).
+_ID_REF_ATTRS = ("aria-labelledby", "aria-describedby", "aria-owns", "headers")
+
+
+def _collect_idref_attributes(soup, ids):
+    """Add ids referenced via aria-*/headers idref lists and <label for>."""
+    for tag in soup.find_all(True):
+        for attr in _ID_REF_ATTRS:
+            value = tag.get(attr)
+            if not value:
+                continue
+            # bs4 may return a list (for known space-separated attrs) or a raw string;
+            # join then split so both shapes yield the individual id tokens.
+            text = " ".join(value) if isinstance(value, list) else value
+            for piece in text.split():
+                ids.add(piece)
+        if tag.name == "label":
+            target = tag.get("for")
+            if target:
+                ids.add(target)
+
+
 def _collect_from_html(markup, classes, ids):
     """Pull references out of an HTML file: inline <style>, <script>, and fragments."""
     _collect_fragment_ids(markup, ids)
@@ -223,6 +265,7 @@ def _collect_from_html(markup, classes, ids):
         text = script.get_text()
         if text:
             _collect_js_tokens(text, classes, ids)
+    _collect_idref_attributes(soup, ids)
 
 
 def build_reference_index(zip_file, opf_soup, opf_dir):

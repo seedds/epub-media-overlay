@@ -93,6 +93,63 @@ def test_mixed_declarations_count_as_reference():
     assert "x" in classes
 
 
+# --- at-rule (conditional group) recursion --------------------------------
+
+
+def test_class_inside_media_query_is_referenced():
+    # A class styled only inside @media must still be indexed, or the stripper
+    # deletes it from the book. (Regression: at-rules were skipped entirely.)
+    classes, ids = _css_classes(
+        "@media screen and (min-width: 40em) { .highlight { background: yellow } }"
+    )
+    assert "highlight" in classes
+
+
+def test_id_and_class_inside_supports_is_referenced():
+    classes, ids = _css_classes(
+        "@supports (display: grid) { #grid-note { color: red } .grid-only { display: grid } }"
+    )
+    assert "grid-only" in classes
+    assert "grid-note" in ids
+
+
+def test_nested_at_rules_recurse():
+    classes, ids = _css_classes(
+        "@media screen { @supports (gap: 1px) { .deep { gap: 1px } } }"
+    )
+    assert "deep" in classes
+
+
+def test_inert_only_rule_inside_media_still_not_referenced():
+    # The inert-rule filter must still apply inside a conditional block.
+    classes, ids = _css_classes(
+        "@media print { .koboSpan { -webkit-text-combine: inherit } }"
+    )
+    assert "koboSpan" not in classes
+
+
+# --- idref attributes (aria-*, label for, td headers) ---------------------
+
+
+def test_aria_and_label_and_headers_ids_are_referenced():
+    # These reference element ids WITHOUT a leading '#', so the fragment scan misses
+    # them; they must be collected from the attributes or the stripper deletes the
+    # ids and leaves dangling accessibility references.
+    html = (
+        "<html><body>"
+        '<h2 id="s1">Sec</h2><h3 id="s2">Sub</h3>'
+        '<div aria-labelledby="s1 s2">x</div>'
+        '<div aria-describedby="s2">y</div>'
+        '<label for="fld">Name</label><input id="fld"/>'
+        '<table><tr><th id="h1">H</th></tr>'
+        '<tr><td headers="h1">v</td></tr></table>'
+        "</body></html>"
+    )
+    classes, ids = set(), set()
+    eri._collect_from_html(html, classes, ids)
+    assert {"s1", "s2", "fld", "h1"} <= ids
+
+
 # --- fragment id extraction -----------------------------------------------
 
 

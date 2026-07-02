@@ -9,6 +9,7 @@ resume behavior after interruption.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import json
 import logging
@@ -100,6 +101,23 @@ def fingerprint_file(path: Path) -> dict[str, Any]:
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
     }
+
+
+def content_fingerprint(path: Path) -> dict[str, Any] | None:
+    """Size + SHA-256 identity of a file's bytes, or None if it does not exist.
+
+    Used to bind validation.json to the exact packaged EPUB it validated, so a later
+    run that rebuilt the EPUB (or deleted it) does not reuse a stale validation
+    result. Unlike fingerprint_file this ignores mtime/path, so a byte-identical
+    re-package is still recognised as the same artifact.
+    """
+    if not path.exists():
+        return None
+    hasher = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            hasher.update(block)
+    return {"size": path.stat().st_size, "sha256": hasher.hexdigest()}
 
 
 def atomic_write_text(path: Path, content: str) -> None:
@@ -485,23 +503,33 @@ def preflight(config: PipelineConfig, logger: logging.Logger) -> None:
     ensure_nltk_resources(logger)
 
 
-def reset_derived_artifacts(paths: RuntimePaths) -> None:
+def reset_derived_artifacts(paths: RuntimePaths, source_epub: Path | None = None) -> None:
     """Remove derived downstream artifacts while preserving the expensive
     split/transcribe outputs in run/ (audio chunks and transcript JSON).
 
     This is used when the saved work state no longer matches the current inputs.
     Transcription is expensive and non-deterministic, so transcripts are never
     destroyed automatically; the stage reconcile step re-validates every artifact
-    against the current config on the next run and re-derives whatever is stale.
+    against the current config on the next run (via the compatibility stamps written
+    alongside each chunk/transcript) and re-derives whatever is stale.
+
+    `source_epub` guards against deleting the user's input file when --work-dir
+    points at the folder that contains the source EPUB (the packaged working EPUB
+    and the source can then share a path).
     """
     for target in (paths.matched_list_path, paths.segmented_snapshot_path, paths.validation_path):
         if target.is_file():
             target.unlink()
 
-    # Packaged working EPUB lives at the work-dir root as <stem>.epub.
+    # Packaged working EPUB lives at the work-dir root as <stem>.epub. Never delete
+    # the source EPUB itself if it happens to live at the work-dir root.
+    source_resolved = source_epub.resolve() if source_epub is not None else None
     for packaged in sorted(paths.root.glob("*.epub")):
-        if packaged.is_file():
-            packaged.unlink()
+        if not packaged.is_file():
+            continue
+        if source_resolved is not None and packaged.resolve() == source_resolved:
+            continue
+        packaged.unlink()
 
     # SMIL files generated into the run dir.
     if paths.run_dir.is_dir():
@@ -520,7 +548,7 @@ def initialize_state(config: PipelineConfig, paths: RuntimePaths) -> tuple[dict[
             # Inputs/config changed: drop derived downstream artifacts and reset
             # state, but keep run/ (chunks + transcripts) intact so we never throw
             # away expensive transcription work the user did not ask to redo.
-            reset_derived_artifacts(paths)
+            reset_derived_artifacts(paths, config.epub)
             existing_state = None
             mode = "signature_reset"
         else:
@@ -833,7 +861,9 @@ def reconcile_stage_from_artifacts(
         if not audio_files:
             return None
         transcript_files = expected_transcript_files(audio_files)
-        if any(not (paths.run_dir / name).exists() for name in transcript_files):
+        # Existence is not enough: a transcript must carry a stamp matching the
+        # current model/language/backend and its parent chunk, or it is re-derived.
+        if any(not legacy.is_transcript_complete(book_info, name) for name in audio_files):
             return None
         state.setdefault("artifacts", {})["audio_files"] = audio_files
         state["artifacts"]["transcript_files"] = transcript_files
@@ -916,6 +946,14 @@ def reconcile_stage_from_artifacts(
     if stage == "validate":
         validation = load_json_if_exists(paths.validation_path)
         if not isinstance(validation, dict) or "ok" not in validation or "results" not in validation:
+            return None
+        # The stored result must have validated the EPUB that exists now. A rebuilt
+        # (or deleted) packaged EPUB whose bytes differ from validated_epub means the
+        # cached result is stale and validation must re-run.
+        current_epub = content_fingerprint(paths.packaged_epub_path)
+        if current_epub is None:
+            current_epub = content_fingerprint(paths.output_path)
+        if current_epub is None or validation.get("validated_epub") != current_epub:
             return None
         return validation
 
@@ -1154,6 +1192,9 @@ def run_validate_stage(
     matched_list = load_matched_list(paths) if paths.matched_list_path.exists() else None
     book_info = build_book_info(state, paths, matched_list)
     results = legacy.run_post_checks(book_info)
+    # Bind the result to the exact EPUB it validated so a later run that rebuilds (or
+    # deletes) the packaged EPUB cannot reuse this stale result via reconcile.
+    results["validated_epub"] = content_fingerprint(paths.packaged_epub_path)
     atomic_write_json(paths.validation_path, results)
     logger.info("Validation summary: %s", results["summary"])
     return results

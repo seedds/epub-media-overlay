@@ -317,6 +317,33 @@ INLINE_TAGS = {
     "time",
     "label",
     "button",
+    # HTML5 inline elements that were missing: without these, an unlisted inline tag
+    # is walked transparently and never re-emitted during segment reconstruction, so
+    # e.g. <s>$50</s> silently loses its strikethrough. `strike`/`del` above already
+    # cover the deprecated/other strike-through spellings; `s` is the HTML5 one.
+    "s",
+    "bdi",
+    "data",
+    "output",
+}
+
+# Tags whose *position* is load-bearing even when they contain no text: removing an
+# empty <td> shifts every later cell in its row a column to the left; removing an
+# empty <li> renumbers an ordered list; removing an empty <option> drops a choice.
+# These must survive the empty-attribute-free cleanup that otherwise decomposes
+# genuinely inert wrappers.
+STRUCTURAL_EMPTY_SIGNIFICANT_TAGS = {
+    "td",
+    "th",
+    "tr",
+    "li",
+    "dt",
+    "dd",
+    "option",
+    "colgroup",
+    "thead",
+    "tbody",
+    "tfoot",
 }
 
 # Common sentence-starting words. Used to disambiguate a lone uppercase letter
@@ -432,12 +459,15 @@ def _unwrap_bare_wrapper_spans(soup: BeautifulSoup) -> None:
 def _remove_empty_attribute_free_tags(soup: BeautifulSoup) -> None:
     """Remove tags that are empty and attribute-free, leaving structure intact.
 
-    Void tags (which are meaningful even when empty) and `<a>` (empty anchors are
-    load-bearing navigation targets) are never removed. Emptiness means no child tags
-    and no non-whitespace text.
+    Void tags (which are meaningful even when empty), `<a>` (empty anchors are
+    load-bearing navigation targets), and structurally positional tags such as
+    `<td>`/`<li>` (see STRUCTURAL_EMPTY_SIGNIFICANT_TAGS) are never removed.
+    Emptiness means no child tags and no non-whitespace text.
     """
     for tag in list(soup.find_all(True)):
         if tag.name in VOID_TAGS or tag.name == "a":
+            continue
+        if tag.name in STRUCTURAL_EMPTY_SIGNIFICANT_TAGS:
             continue
         if tag.attrs:
             continue

@@ -155,7 +155,6 @@ import re
 import shutil
 import subprocess
 import warnings
-import xml.dom.minidom as minidom
 import zipfile
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -354,21 +353,15 @@ def replace_files_in_zip(zip_path, replacements):
 
 
 def convert_soup_to_html(soup):
-    # BeautifulSoup/minidom give us a stable enough serialization for generated XML,
-    # but OPF namespace prefixes like `opf:` can leak into output in ways that are
-    # syntactically noisy and not useful for our packaged artifacts.
-    xml_str = str(soup).replace("opf:", "")
-
-    # Reparse through minidom to get readable indentation. This is primarily for human
-    # inspection/debuggability; the EPUB readers do not care about pretty printing.
-    dom = minidom.parseString(xml_str)
-    pretty_xml = dom.toprettyxml(indent="  ", newl="\n")
-
-    # CORRECTED: Remove ONLY blank lines (whitespace-only lines)
-    lines = [line for line in pretty_xml.splitlines() if line.strip() != ""]
-    cleaned_xml = "\n".join(lines) + "\n"  # Ensure single trailing newline
-
-    return cleaned_xml
+    # Serialize the soup directly. We previously round-tripped through
+    # minidom.parseString(str(soup)) purely for pretty-printed indentation, which
+    # forced a `str(soup).replace("opf:", "")` beforehand because minidom rejects the
+    # undeclared `opf:` prefix. That blind string replace silently corrupted any text
+    # or attribute containing the substring `opf:` (e.g. `opf:role`/`opf:file-as`
+    # attributes and prose mentioning `opf:`). BeautifulSoup already emits well-formed
+    # XML with the namespace prefix declared, and EPUB readers do not care about
+    # indentation, so serializing str(soup) directly is both correct and cheaper.
+    return str(soup)
 
 
 def get_relative_zip_href(source_path, target_path):
@@ -539,8 +532,122 @@ def get_primary_audio_stream_duration(audio_path):
         if parsed_duration > 0.0:
             return parsed_duration
 
-    fallback_duration = get_audio_duration(audio_path, [])
+    # Last-resort format-level probe. This helper's contract is to return None (not
+    # raise) on any failure, since callers such as is_audio_chunk_complete treat None
+    # as "duration unknown -> chunk not verifiable". get_audio_duration now raises
+    # when it cannot determine a duration, so translate that back into None here.
+    try:
+        fallback_duration = get_audio_duration(audio_path, [])
+    except RuntimeError:
+        return None
     return fallback_duration if fallback_duration > 0.0 else None
+
+
+# === Artifact compatibility stamps =========================================
+#
+# The split and transcribe stages are expensive, so a signature change (see
+# build_signature in generate_epub_overlay.py) deliberately preserves the run/
+# chunks and transcripts rather than deleting them. Reconcile then decides, per
+# artifact, whether the preserved file is still valid for the *current* config.
+#
+# Historically reconcile checked only existence (transcripts) or duration (chunks),
+# so a chunk cut with a different codec/bitrate, or a transcript from a different
+# model/language, was silently reused. To make the reconcile actually re-validate
+# (as its docstring always promised), each produced artifact gets a sidecar `.meta`
+# JSON stamp recording the config that produced it. The stamp is written *last*
+# (after the artifact itself), so a stamp's presence proves the artifact was fully
+# written -- which also makes a Ctrl-C/crash-truncated transcript detectable (no
+# stamp -> re-derive), independent of atomic writes.
+#
+# Note: artifacts produced before stamps existed have no `.meta`, so the first run
+# after this change re-splits and re-transcribes. That is intentional -- accepting a
+# stampless artifact would reintroduce the exact hole this closes.
+
+
+def _stamp_path_for(artifact_path):
+    return f"{artifact_path}.meta"
+
+
+def chunk_compatibility_stamp(book_info, chunk_info):
+    """Config that must match for a preserved audio chunk to be reused as-is."""
+    return {
+        "kind": "audio_chunk",
+        "audio_codec": book_info.get("audio_codec", "copy"),
+        "audio_bitrate": book_info.get("audio_bitrate"),
+        "audio_sample_rate": book_info.get("audio_sample_rate"),
+        "audio_channels": book_info.get("audio_channels"),
+        "chunk_seconds": book_info.get("chunk_seconds"),
+        "start_time": str(chunk_info["start_time"]),
+        "end_time": str(chunk_info["end_time"]),
+    }
+
+
+def transcript_compatibility_stamp(book_info, chunk_stamp):
+    """Config that must match for a preserved transcript to be reused as-is.
+
+    Embeds the parent chunk's stamp so re-cutting the chunk (different codec, chunk
+    boundaries, etc.) also invalidates the transcript that was aligned against it.
+    """
+    return {
+        "kind": "transcript",
+        "backend": book_info.get("backend"),
+        "model": book_info.get("model"),
+        "language": book_info.get("language"),
+        "chunk_stamp": chunk_stamp,
+    }
+
+
+def write_compatibility_stamp(artifact_path, stamp):
+    """Write a stamp sidecar next to an artifact. Call *after* the artifact exists."""
+    atomic_write_json_local(_stamp_path_for(artifact_path), stamp)
+
+
+def read_compatibility_stamp(artifact_path):
+    stamp_path = _stamp_path_for(artifact_path)
+    if not os.path.exists(stamp_path):
+        return None
+    try:
+        with open(stamp_path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def stamp_matches(artifact_path, expected_stamp):
+    """True if the artifact has a stamp equal to expected_stamp."""
+    return read_compatibility_stamp(artifact_path) == expected_stamp
+
+
+def is_transcript_complete(book_info, chunk_basename):
+    """True if the transcript for `chunk_basename` exists and is valid for the current
+    config (matching model/language/backend and produced from the current chunk).
+
+    Used by the transcribe-stage reconcile so a transcript from a prior run with a
+    different model/language/chunking is re-derived instead of silently reused.
+    """
+    chunk_path = resolve_book_path(book_info, chunk_basename)
+    json_basename = chunk_basename.replace(book_info["audio_extension"], ".json")
+    json_path = resolve_book_path(book_info, json_basename)
+    if not os.path.exists(json_path):
+        return False
+    expected = transcript_compatibility_stamp(
+        book_info, read_compatibility_stamp(chunk_path)
+    )
+    return stamp_matches(json_path, expected)
+
+
+def atomic_write_json_local(path, payload):
+    """Atomically write JSON to `path` (temp file + os.replace).
+
+    pipeline_core has no shared atomic-write helper (only zip repackaging uses
+    os.replace), and the transcript write historically used a plain open()+dump that
+    truncates the target in place. This mirrors generate_epub_overlay.atomic_write_*
+    so transcripts and stamps can never be left half-written at their final path.
+    """
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+    os.replace(tmp_path, path)
 
 
 def is_audio_chunk_complete(
@@ -552,6 +659,12 @@ def is_audio_chunk_complete(
         tolerance = split_audio_duration_tolerance(book_info)
     output_path = resolve_book_path(book_info, chunk_info["output_name"])
     if not os.path.exists(output_path):
+        return False
+
+    # The chunk must have been produced by the current audio config, not merely be a
+    # file of the right duration. Without this, a chunk stream-copied in a prior run
+    # would pass the duration check after the user switched to (e.g.) aac/64k.
+    if not stamp_matches(output_path, chunk_compatibility_stamp(book_info, chunk_info)):
         return False
 
     expected_duration = expected_chunk_duration(chunk_info)
@@ -611,6 +724,10 @@ def split_audio_chunk(book_info, chunk_info):
     if result.returncode != 0:
         error_output = (result.stderr or result.stdout or "Unknown ffmpeg error").strip()
         raise RuntimeError(f"ffmpeg failed while creating {out_name}: {error_output}")
+    # Stamp the chunk with the config that produced it *before* the completeness
+    # check (which now requires a matching stamp). Written after ffmpeg succeeds so a
+    # stamp only exists for a fully created chunk.
+    write_compatibility_stamp(output_path, chunk_compatibility_stamp(book_info, chunk_info))
     if not is_audio_chunk_complete(book_info, chunk_info):
         raise RuntimeError(f"ffmpeg created an invalid audio chunk: {out_name}")
 
@@ -679,12 +796,19 @@ def transcribe_audio(book_info):
     batch_size = int(book_info.get("batch_size") or 1)
 
     for file in tqdm(
-        sorted(glob.glob(f"*{book_info['audio_extension']}")),
+        sorted_chunk_files(book_info["audio_extension"]),
         desc="Transcribing audio",
         unit="chunk",
     ):
         json_file = file.replace(book_info["audio_extension"], ".json")
-        if os.path.exists(json_file):
+        # Skip only if a prior transcript exists AND its stamp matches the current
+        # model/language/backend AND references the current chunk stamp. A stampless
+        # or mismatched transcript (different config, or a crash-truncated file that
+        # never got its stamp) is re-transcribed rather than silently reused.
+        expected_stamp = transcript_compatibility_stamp(
+            book_info, read_compatibility_stamp(file)
+        )
+        if os.path.exists(json_file) and stamp_matches(json_file, expected_stamp):
             continue
 
         stdout_buffer = io.StringIO()
@@ -706,9 +830,10 @@ def transcribe_audio(book_info):
                 ) from exc
             raise RuntimeError(f"transcription failed for {file}: {exc}") from exc
 
-        with open(json_file, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False)
-            
+        # Write the transcript atomically, then its stamp last, so an interrupted
+        # write leaves neither a truncated transcript at the final path nor a stamp.
+        atomic_write_json_local(json_file, result)
+        write_compatibility_stamp(json_file, expected_stamp)
 
 
 
@@ -1200,8 +1325,17 @@ def link_html_with_audio(book_info):
                     ):
                         match_stats["backward_warnings"] += 1
 
-        except json.JSONDecodeError:
-            match_stats["decode_errors"] += 1
+        except json.JSONDecodeError as exc:
+            # With per-transcript compatibility stamps, a transcript that reaches the
+            # matcher is guaranteed to have been fully and atomically written (the
+            # stamp is written last), so an unparseable transcript here indicates real
+            # corruption rather than an interrupted write. Fail loudly instead of
+            # silently dropping the chunk's chapter from the overlay.
+            raise RuntimeError(
+                f"Transcript {json_file!r} is not valid JSON; its chapter would be "
+                f"silently dropped from the overlay. Re-run the transcribe stage "
+                f"(or delete {json_file!r} and its .meta) to regenerate it: {exc}"
+            ) from exc
         except Exception:
             match_stats["processing_errors"] += 1
 
@@ -1789,10 +1923,18 @@ def get_audio_duration(audio_path, fallback_matches):
                 text=True,
             ).strip()
         )
-    except Exception:
+    except Exception as exc:
         if fallback_matches:
             return fallback_matches[-1]["end"] + 1.0
-        return 0.0
+        # No fallback and ffprobe failed: returning 0.0 here silently corrupts
+        # downstream consumers -- the split stage computes "0 chunks", and
+        # finalize_segment_timestamps anchors the last segment's end to 0.0, dropping
+        # a chunk's final segment from the SMIL. Fail loudly instead of shipping a
+        # truncated overlay.
+        raise RuntimeError(
+            f"Could not determine audio duration for {audio_path!r} (ffprobe failed "
+            f"and no fallback timing was available): {exc}"
+        ) from exc
 
 
 # === Post-generation validation helpers ===
@@ -1821,13 +1963,69 @@ def resolve_book_path(book_info, file_name):
     return os.path.join(get_book_folder(book_info), file_name)
 
 
+# Audio chunks are named `NNN<ext>` (zero-padded index, >= 3 digits) by
+# plan_audio_chunks (see the `output_name` format there). The prepare stage also
+# copies the *source* audiobook into the same working dir under its original name,
+# so a bare `*<ext>` glob would sweep that full-length source file into the
+# transcription / matching / packaging stages when the source extension happens to
+# equal the chunk extension (true by default: source `.m4a` + default `.m4a`
+# chunks). Match chunk names positively rather than trying to exclude the one
+# known source name, so any non-chunk file in the working dir is ignored.
+CHUNK_BASENAME_RE = re.compile(r"^\d{3,}\.[^.]+$")
+
+
+def is_chunk_basename(name, audio_extension):
+    """True if `name` is a split audio chunk (NNN<ext>) for the given extension."""
+    return bool(CHUNK_BASENAME_RE.match(name)) and name.endswith(audio_extension)
+
+
+def sorted_chunk_files(audio_extension):
+    """Sorted split-audio chunk basenames in the current working directory.
+
+    Excludes the copied source audiobook (and any other stray audio file) so only
+    genuine `NNN<ext>` chunks are transcribed / matched / packaged.
+    """
+    return sorted(
+        name
+        for name in glob.glob(f"*{audio_extension}")
+        if is_chunk_basename(name, audio_extension)
+    )
+
+
+# EPUB manifest media-type by audio file extension. The packaged chunk extension is
+# configurable (`--audio-extension`) and independent of the codec, so hardcoding
+# `audio/mp4` mislabels e.g. `.mp3`/`.aac`/`.ogg` assets in the OPF manifest.
+_AUDIO_MEDIA_TYPE_BY_EXT = {
+    ".m4a": "audio/mp4",
+    ".m4b": "audio/mp4",
+    ".mp4": "audio/mp4",
+    ".aac": "audio/aac",
+    ".mp3": "audio/mpeg",
+    ".opus": "audio/ogg",
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".wav": "audio/wav",
+    ".flac": "audio/flac",
+}
+
+
+def audio_media_type(book_info):
+    """OPF manifest media-type for the configured audio extension."""
+    ext = (book_info.get("audio_extension") or "").lower()
+    return _AUDIO_MEDIA_TYPE_BY_EXT.get(ext, "audio/mp4")
+
+
 def iter_audio_files(book_info):
     audio_extension = book_info.get("audio_extension")
     if not audio_extension:
         return []
 
     pattern = os.path.join(get_book_folder(book_info), f"*{audio_extension}")
-    return sorted(os.path.basename(path) for path in glob.glob(pattern))
+    return sorted(
+        name
+        for name in (os.path.basename(path) for path in glob.glob(pattern))
+        if is_chunk_basename(name, audio_extension)
+    )
 
 
 def iter_smil_files(book_info):
@@ -1862,13 +2060,23 @@ def get_audio_inventory(book_info):
         if os.path.exists(json_path):
             word_count = len(load_audio_tokens(json_path))
 
+        # This inventory feeds the read-only post-check/validation stage, whose job is
+        # to *report* problems rather than abort. get_audio_duration raises when it
+        # cannot probe a file; downstream coverage checks compare duration
+        # numerically, so record 0.0 (a "no coverage" sentinel they already handle)
+        # instead of letting an unprobeable file crash validation.
+        try:
+            duration = get_audio_duration(
+                resolve_book_path(book_info, audio_file), fallback_matches=[]
+            )
+        except RuntimeError:
+            duration = 0.0
+
         inventory.append(
             {
                 "audio_file": audio_file,
                 "json_file": json_file,
-                "duration": get_audio_duration(
-                    resolve_book_path(book_info, audio_file), fallback_matches=[]
-                ),
+                "duration": duration,
                 "word_count": word_count,
             }
         )
@@ -2153,16 +2361,18 @@ def test_missing_long_audio(book_info, min_duration=180.0, min_words=300):
 
 
 def test_missing_transcripts(book_info):
-    # The pass condition is intentionally simple: every `.m4a` should have a readable
-    # sibling `.json` with at least one usable word. This catches missing, broken, or
-    # empty transcription artifacts before later stages fail more opaquely.
-    audio_pattern = os.path.join(get_book_folder(book_info), "*.m4a")
-    audio_files = sorted(os.path.basename(path) for path in glob.glob(audio_pattern))
+    # The pass condition is intentionally simple: every audio chunk should have a
+    # readable sibling `.json` with at least one usable word. This catches missing,
+    # broken, or empty transcription artifacts before later stages fail more opaquely.
+    # Use the configured audio extension (via iter_audio_files) rather than a
+    # hardcoded `*.m4a`, otherwise this check silently self-skips for any other
+    # extension and run_post_checks counts the skip as a pass.
+    audio_files = iter_audio_files(book_info)
     if not audio_files:
         return build_check_result(
             "missing_transcripts",
             True,
-            "No .m4a files were found to validate.",
+            "No audio chunks were found to validate.",
             metrics={"audio_files": 0},
             skipped=True,
         )
@@ -2206,9 +2416,9 @@ def test_missing_transcripts(book_info):
         "missing_transcripts",
         ok=not findings,
         summary=(
-            "Every .m4a file has a readable transcript with at least one word."
+            "Every audio chunk has a readable transcript with at least one word."
             if not findings
-            else f"{len(findings)} .m4a file(s) are missing a usable transcript."
+            else f"{len(findings)} audio chunk(s) are missing a usable transcript."
         ),
         findings=findings,
         metrics={"audio_files": len(audio_files)},
@@ -3102,8 +3312,8 @@ def merge_files(book_info):
     )
 
     with zipfile.ZipFile(book_info["out_file"], "a") as f:
-        # Get the list of file names in the ZIP
-        for file in sorted(glob.glob(f"*{book_info['audio_extension']}")):
+        # Package only the split chunks, never the copied source audiobook.
+        for file in sorted_chunk_files(book_info["audio_extension"]):
             f.write(file, f"audio/{file}")
 
         for file in sorted(glob.glob("*.smil")):
@@ -3204,14 +3414,14 @@ def post_processing_opf(book_info):
                     nav_points,
                 )
 
-        # Declare all packaged split-audio files.
-        for file_name in sorted(glob.glob(f"*{book_info['audio_extension']}")):
+        # Declare all packaged split-audio files (chunks only, not the source copy).
+        for file_name in sorted_chunk_files(book_info["audio_extension"]):
             item = soup.new_tag(
                 "item",
                 attrs={
-                    "id": f"audio_{file_name.replace('book_info.get(audio_extension)', '')}",
+                    "id": f"audio_{file_name}",
                     "href": get_relative_zip_href(opf_file, f"audio/{file_name}"),
-                    "media-type": "audio/mp4",
+                    "media-type": audio_media_type(book_info),
                 },
             )
             manifest.append(item)

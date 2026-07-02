@@ -136,9 +136,29 @@ def test_empty_anchor_with_referenced_id_untouched():
     assert out == '<p><a id="fn1"></a>t</p>'
 
 
+def test_empty_table_cell_never_removed():
+    # An empty <td> is positional: removing it shifts every later cell left a column.
+    out = _inner(_wrap("<table><tr><td></td><td>A</td></tr></table>"))
+    soup = BeautifulSoup(_wrap(out), "lxml")
+    assert len(soup.find_all("td")) == 2
+
+
+def test_empty_list_item_never_removed():
+    # An empty <li> is positional: removing it renumbers an ordered list.
+    out = _inner(_wrap("<ol><li></li><li>x</li></ol>"))
+    soup = BeautifulSoup(_wrap(out), "lxml")
+    assert len(soup.find_all("li")) == 2
+
+
 def test_default_styled_inline_tag_kept():
     out = _inner(_wrap("<p><b>x</b></p>"))
     assert out == "<p><b>x</b></p>"
+
+
+def test_html5_strikethrough_inline_tag_kept():
+    # <s> is an inline formatting tag; it must not be dropped during reconstruction.
+    out = _inner(_wrap("<p><s>x</s></p>"))
+    assert out == "<p><s>x</s></p>"
 
 
 def test_void_tags_kept():
