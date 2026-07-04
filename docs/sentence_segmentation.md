@@ -61,14 +61,19 @@ The English model is the fallback when a language-specific model is missing.
 
 ### 3. Abbreviation set
 
-The tokenizer's abbreviation set is assembled from three sources:
+The tokenizer's abbreviation set is assembled from two sources:
 
 - **Inherited** abbreviations from Punkt's pretrained model (`Jan.`, `Corp.`,
-  `Gen.`, US state abbreviations, etc.).
+  `Gen.`, US state abbreviations, and a number of single letters such as `c.`,
+  `m.`, `s.`, etc.).
 - A **curated `extra` list** of editorial/book abbreviations Punkt tends to
-  over-split on (`Mr.`, `Mrs.`, `Dr.`, `St.`, `p.m.`, `U.S.`, ...).
-- **Single letters `a`–`z`**, so initials like `Mr. Y.` are not treated as
-  sentence ends.
+  over-split on (`Mr.`, `Mrs.`, `Dr.`, `St.`, `p.m.`, `U.S.`, `M.A.`, ...).
+
+The code does **not** add the full range of single letters `a`–`z` itself; only
+the subset Punkt inherits is present (so `a.`, `b.`, `i.`, `y.`, ... are absent).
+Lone initials like `Mr. Y.` stay merged through a combination of that inherited
+subset, Punkt's own initial detection, and the possessive/lone-initial repair
+passes below — not a blanket `a`–`z` entry.
 
 ### 4. Manual merge pass (`mark_sentence.py:841`)
 
@@ -112,6 +117,8 @@ behaviour. Representative cases:
 | `Mr. Y.'s speech,` | Single-letter initial `Y.` must not split; needs single-letter abbreviations. |
 | `a meaningful moment in U.S. history.` | Dotted abbreviation `U.S.` stays intact (guarded by the `u.s` abbreviation). |
 | `it’s us. Electronics is gonna…` | Real sentence break after the pronoun `us.` — only the dotted `u.s` is curated, not the bare word `us`. |
+| `He earned his M.A. from Yale.` | Dotted abbreviation `M.A.` stays intact (guarded by the `m.a` abbreviation), mirroring `U.S.`/`u.s`. |
+| `...couldn't hit his ma. Even if...` | Real sentence break after the common noun `ma.` — only the dotted `m.a` is curated, not the bare word `ma` (mirrors `us`/`u.s`). |
 | `...heard anything of you … must come...` | Ellipsis acts as a sentence break. |
 | `she looked at me reproachfully . . .` | Spaced ellipsis stays in one segment; Punkt's per-dot over-split is merged back. |
 | `Well . . . I suppose so.` | Spaced ellipsis stays with the text before it (`Well . . . `), then a real split before the next sentence. |

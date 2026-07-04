@@ -843,15 +843,17 @@ def _get_sentence_boundaries(text: str, language: str) -> List[Tuple[int, int]]:
             "phd",
             "md",
             "ba",
-            "ma",
             "sgt",
             "am",
             "pm",
-            # Only the dotted form "u.s" guards the United States abbreviation.
-            # The bare token "us" is intentionally omitted: it collides with the
-            # common pronoun "us", which would block real sentence breaks after
-            # "...us." (e.g. "it's us. Electronics...").
+            # Only the dotted forms "u.s"/"m.a" guard these abbreviations. Their
+            # bare tokens "us"/"ma" are intentionally omitted: each collides with a
+            # common word (the pronoun "us"; "ma" = mother), which would block real
+            # sentence breaks after "...us." / "...ma." (e.g. "it's us. Electronics..."
+            # and "...couldn't hit his ma. Even if..."). The dotted forms let Punkt
+            # keep "U.S." and "M.A." intact without suppressing those word breaks.
             "u.s",
+            "m.a",
         ]
         params.abbrev_types.update(extra)
         # Punkt's pretrained English model inherits a few abbreviations that are

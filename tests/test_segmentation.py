@@ -229,6 +229,17 @@ CASES: list[tuple[str, list[str]]] = [
         "The report was written by Dr. I. Newman.",
         ["The report was written by Dr. I. Newman."],
     ),
+    (
+        "because he couldn’t hit his ma. Even if she’d been there,",
+        [
+            "because he couldn’t hit his ma. ",
+            "Even if she’d been there,"
+        ],
+    ),
+    (
+        "He earned his M.A. from Yale.",
+        ["He earned his M.A. from Yale."],
+    ),
 ]
 
 
@@ -255,9 +266,9 @@ if __name__ == "__main__":
         try:
             got = _segments(text)
             assert got == expected, f"expected {expected!r}, got {got!r}"
-            print(f"PASS {label}")
+            print(f"✅ {label}")
         except AssertionError as exc:
             failures.append((label, exc))
-            print(f"FAIL {label}: {exc}")
+            print(f"❌ {label}: {exc}")
     print(f"\n{len(CASES) - len(failures)}/{len(CASES)} passed")
     raise SystemExit(1 if failures else 0)
