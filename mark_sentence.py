@@ -844,14 +844,19 @@ def _get_sentence_boundaries(text: str, language: str) -> List[Tuple[int, int]]:
             "md",
             "ba",
             "sgt",
-            "am",
-            "pm",
             # Only the dotted forms "u.s"/"m.a" guard these abbreviations. Their
             # bare tokens "us"/"ma" are intentionally omitted: each collides with a
             # common word (the pronoun "us"; "ma" = mother), which would block real
             # sentence breaks after "...us." / "...ma." (e.g. "it's us. Electronics..."
             # and "...couldn't hit his ma. Even if..."). The dotted forms let Punkt
             # keep "U.S." and "M.A." intact without suppressing those word breaks.
+            #
+            # Bare "am"/"pm" are likewise omitted: "am" collides with the verb, so
+            # adding it would block real breaks after "...am." (e.g. "Yes, I am. And
+            # you're..."). Punkt handles the dotted "a.m."/"p.m." via its own
+            # internal-period abbreviation logic, so those stay intact without a bare
+            # entry. Tradeoff: an un-dotted time like "...at 10 am. Then..." now
+            # splits — accepted, since the verb "am" is far more common in prose.
             "u.s",
             "m.a",
         ]

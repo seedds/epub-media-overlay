@@ -240,6 +240,38 @@ CASES: list[tuple[str, list[str]]] = [
         "He earned his M.A. from Yale.",
         ["He earned his M.A. from Yale."],
     ),
+    (
+        "Yes, I am. And you’re one fucking thief who will soon be sporting a bullet hole.",
+        [
+            "Yes, ",
+            "I am. ",
+            "And you’re one fucking thief who will soon be sporting a bullet hole."
+        ],
+    ),
+    (
+        # Dotted "a.m." stays intact via Punkt's internal-period abbreviation logic.
+        "The meeting is at 10 a.m. tomorrow.",
+        ["The meeting is at 10 a.m. tomorrow."],
+    ),
+    (
+        "We left at 7:30 p.m. and drove home.",
+        ["We left at 7:30 p.m. and drove home."],
+    ),
+    (
+        # Dotted form holds even before a capitalized sentence-starter.
+        "The show starts at 8 p.m. Be there early.",
+        ["The show starts at 8 p.m. Be there early."],
+    ),
+    (
+        # Bare "am"/"pm" are intentionally not abbreviations (they collide with the
+        # verb "am"), so an un-dotted time splits at the sentence break. Accepted
+        # tradeoff mirroring the "us"/"ma" cases above.
+        "We met at 10 am. Then we left.",
+        [
+            "We met at 10 am. ",
+            "Then we left.",
+        ],
+    ),
 ]
 
 

@@ -119,6 +119,9 @@ behaviour. Representative cases:
 | `it’s us. Electronics is gonna…` | Real sentence break after the pronoun `us.` — only the dotted `u.s` is curated, not the bare word `us`. |
 | `He earned his M.A. from Yale.` | Dotted abbreviation `M.A.` stays intact (guarded by the `m.a` abbreviation), mirroring `U.S.`/`u.s`. |
 | `...couldn't hit his ma. Even if...` | Real sentence break after the common noun `ma.` — only the dotted `m.a` is curated, not the bare word `ma` (mirrors `us`/`u.s`). |
+| `The meeting is at 10 a.m. tomorrow.` | Dotted `a.m.`/`p.m.` stay intact via Punkt's internal-period logic — no bare entry needed. |
+| `Yes, I am. And you're...` | Real sentence break after the verb `am.` — bare `am`/`pm` are **not** curated (they collide with the verb "am"), only the dotted forms. |
+| `We met at 10 am. Then we left.` | Tradeoff of the above: an un-dotted time splits. Accepted, since the verb "am" is far more common in prose (mirrors `us`/`ma`). |
 | `...heard anything of you … must come...` | Ellipsis acts as a sentence break. |
 | `she looked at me reproachfully . . .` | Spaced ellipsis stays in one segment; Punkt's per-dot over-split is merged back. |
 | `Well . . . I suppose so.` | Spaced ellipsis stays with the text before it (`Well . . . `), then a real split before the next sentence. |
@@ -190,5 +193,8 @@ collision surfaces later, add it to the same `difference_update({...})` set.
   `CASES` list in `tests/test_segmentation.py`, then run
   `python -m pytest tests/test_segmentation.py`.
 - **Add an abbreviation**: extend the `extra` list in `_get_sentence_boundaries()`.
+  If a candidate abbreviation is also a common word (`us`, `ma`, `am`, `pm`),
+  prefer the dotted form (`u.s`, `m.a`) and omit the bare token, so real sentence
+  breaks after that word are not suppressed.
 - **Remove an inherited false-positive abbreviation**: add it to the
   `difference_update({...})` set near `mark_sentence.py:831`.
