@@ -947,6 +947,27 @@ def _get_sentence_boundaries(text: str, language: str) -> List[Tuple[int, int]]:
         split_boundaries.append((start + last_cut, end))
     boundaries = split_boundaries
 
+    # Manual split pass for uppercase time abbreviations. Punkt inherits "p.m"/"a.m"
+    # as abbreviations, so it never breaks after "P.M."/"A.M."; the lone-initial pass
+    # above also can't help (its lookbehind rejects the "M." after "P."). We re-split
+    # when an UPPERCASE "A.M."/"P.M." is followed by a capitalized word ("...9 P.M.
+    # Burn this..."). Restricting to the A.M./P.M. forms leaves "U.S."/"M.A." merged;
+    # the uppercase requirement leaves lowercase "p.m."/"a.m." merged; and requiring a
+    # capitalized next word leaves lowercase continuations ("9 A.M. is good...") merged.
+    # Tradeoff: this over-splits before a capitalized proper noun ("9 A.M. Boston
+    # train..."), since telling an imperative verb from a proper noun needs POS tagging
+    # this module avoids. Accepted, mirroring the am/ma/us decisions noted above.
+    split_boundaries = []
+    for start, end in boundaries:
+        span_text = normalized_text[start:end]
+        last_cut = 0
+        for match in re.finditer(r"(?<![A-Za-z.])[AP]\.M\.\s+([A-Z]\w*)", span_text):
+            cut = match.start(1)  # split right before the next sentence's first word
+            split_boundaries.append((start + last_cut, start + cut))
+            last_cut = cut
+        split_boundaries.append((start + last_cut, end))
+    boundaries = split_boundaries
+
     # Expand boundaries to include trailing whitespace.
     final_boundaries = []
     for start, end in boundaries:

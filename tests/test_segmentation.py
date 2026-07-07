@@ -272,6 +272,13 @@ CASES: list[tuple[str, list[str]]] = [
             "Then we left.",
         ],
     ),
+    (
+        "I will see you at 9 P.M. Burn this & flush the ashes.",
+        [
+            "I will see you at 9 P.M. ",
+            "Burn this & flush the ashes."
+        ],
+    ),
 ]
 
 
