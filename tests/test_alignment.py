@@ -836,6 +836,230 @@ def test_html_declares_toc_helper():
     assert not pc._html_declares_toc(BeautifulSoup("<p>plain</p>", "lxml"))
 
 
+# --- 7. seam-chapter dedup: resolve seam segments to the dominant audio file ---
+#
+# A chapter that straddles an audio-chunk seam is matched from two chunks: the short
+# tail of the previous chunk (span_index 1) and the body of the next chunk
+# (span_index 0). Both contribute clips for the seam segments. The previous chunk's
+# tail holds only a few seconds of the chapter but the aligner + interior-gap fill
+# cram many segments into it -- sometimes with durations that individually rival the
+# body clips. Picking per-segment by duration alone still lets a few tail clips win,
+# punching small holes in the body audio. resolve_segment_clips instead resolves every
+# seam segment to the chapter's dominant (body) audio file so the body stays
+# contiguous.
+
+
+def clips_for(spec):
+    """spec: {seg_id: [(audio_file, start, end), ...]}. Builds the candidate dict
+    resolve_segment_clips consumes."""
+    return {
+        seg_id: [
+            {"id": seg_id, "audio_file": af, "start": s, "end": e}
+            for af, s, e in clips
+        ]
+        for seg_id, clips in spec.items()
+    }
+
+
+def test_clip_duration_helper():
+    assert pc._clip_duration({"start": 10.0, "end": 12.5}) == 2.5
+    # Non-positive / malformed clips are treated as zero-length.
+    assert pc._clip_duration({"start": 5.0, "end": 5.0}) == 0.0
+    assert pc._clip_duration({"start": 9.0, "end": 8.0}) == 0.0
+    assert pc._clip_duration({"start": 0.0}) == 0.0
+
+
+def test_seam_dedup_body_clip_wins_over_crammed_tail():
+    """The real chapter-16 case (016.m4a interior audio was dropped).
+
+    016.m4a is the dominant/body file (many long clips); 015.m4a contributes a few
+    stray tail clips for the same seam segments. Every seam segment must resolve to
+    016.m4a so the body stays contiguous, even where a stray 015 tail clip happens to
+    be longer than its 016 counterpart.
+    """
+    spec = {}
+    # Body clips: 016 dominates with many contiguous clips.
+    for i in range(1, 40):
+        spec[f"segment{i}"] = [("016.m4a", 10.0 + i, 10.0 + i + 0.9)]
+    # Stray tail clips from 015 for two seam segments; segment8's tail clip is even
+    # LONGER than its body clip, which would win under a pure-duration rule.
+    spec["segment8"].append(("015.m4a", 1091.227, 1095.0))  # 3.77s tail vs 0.9s body
+    spec["segment9"].append(("015.m4a", 1095.0, 1095.5))
+    resolved = pc.resolve_segment_clips(clips_for(spec))
+    assert resolved["segment8"]["audio_file"] == "016.m4a"
+    assert resolved["segment9"]["audio_file"] == "016.m4a"
+    # every segment resolves to the dominant body file
+    assert {c["audio_file"] for c in resolved.values()} == {"016.m4a"}
+
+
+def test_seam_dedup_prefers_dominant_even_if_tail_processed_first():
+    """Order independence: the dominant file wins regardless of insertion order."""
+    spec = {f"segment{i}": [("016.m4a", float(i), i + 0.9)] for i in range(1, 30)}
+    # Insert a long stray tail clip first for segment5.
+    spec["segment5"] = [("015.m4a", 1091.0, 1096.0), ("016.m4a", 5.0, 5.9)]
+    resolved = pc.resolve_segment_clips(clips_for(spec))
+    assert resolved["segment5"]["audio_file"] == "016.m4a"
+
+
+def test_seam_dedup_keeps_segment_matched_only_by_nondominant_chunk():
+    """A segment matched solely by a non-dominant chunk (genuine spillover with no
+    body coverage) is still kept rather than dropped."""
+    spec = {f"segment{i}": [("016.m4a", float(i), i + 0.9)] for i in range(1, 30)}
+    spec["segSpill"] = [("015.m4a", 1100.0, 1100.5)]  # only in 015
+    resolved = pc.resolve_segment_clips(clips_for(spec))
+    assert resolved["segSpill"]["audio_file"] == "015.m4a"
+
+
+def test_seam_dedup_single_file_ties_break_by_duration():
+    """When all candidates share the dominant file, the longer clip wins."""
+    spec = {
+        "segA": [("016.m4a", 0.0, 1.0), ("016.m4a", 0.0, 3.0)],
+    }
+    resolved = pc.resolve_segment_clips(clips_for(spec))
+    assert resolved["segA"]["end"] == 3.0
+
+
+def test_anchor_audio_file_tails_extends_last_clip_to_duration(monkeypatch):
+    """After resolving seam segments, the latest-ending clip of each audio file is
+    stretched to the file's true duration so no tail audio is left uncovered.
+
+    Reproduces the 015.m4a tail: chapter_15's last clip ends at 1089.076 but the file
+    runs to 1106.245; the ~17s of "...my god, it's Armstrong" must not be dropped.
+    """
+    durations = {"015.m4a": 1106.245, "016.m4a": 636.714}
+    monkeypatch.setattr(pc, "get_audio_duration", lambda path, _f: durations[os.path.basename(path)])
+
+    ch15_last = {"id": "s639", "audio_file": "015.m4a", "start": 1080.0, "end": 1089.076}
+    aggregated = {
+        "ch15.xhtml": {
+            "s1": {"id": "s1", "audio_file": "015.m4a", "start": 0.0, "end": 5.0},
+            "s639": ch15_last,
+        },
+        "ch16.xhtml": {
+            "s1": {"id": "s1", "audio_file": "016.m4a", "start": 0.0, "end": 2.6},
+            "sN": {"id": "sN", "audio_file": "016.m4a", "start": 630.0, "end": 636.714},
+        },
+    }
+    pc.anchor_audio_file_tails(aggregated, {"folder_name": "/tmp"})
+    # 015 tail extended to full duration; 016 already reached its end (unchanged).
+    assert ch15_last["end"] == 1106.245
+    assert aggregated["ch16.xhtml"]["sN"]["end"] == 636.714
+
+
+def test_anchor_audio_file_tails_skips_unprobeable(monkeypatch):
+    def _raise(path, _f):
+        raise RuntimeError("ffprobe failed")
+
+    monkeypatch.setattr(pc, "get_audio_duration", _raise)
+    clip = {"id": "s1", "audio_file": "x.m4a", "start": 0.0, "end": 5.0}
+    aggregated = {"c.xhtml": {"s1": clip}}
+    pc.anchor_audio_file_tails(aggregated, {"folder_name": "/tmp"})
+    assert clip["end"] == 5.0  # unchanged when duration is unavailable
+
+
+# --- 8. coverage-gap validation + glob-escape fix -----------------------------
+
+
+def test_merge_intervals_basic():
+    assert pc._merge_intervals([(0.0, 5.0), (5.0, 8.0)]) == [(0.0, 8.0)]  # adjacent
+    assert pc._merge_intervals([(0.0, 5.0), (3.0, 8.0)]) == [(0.0, 8.0)]  # overlapping
+    assert pc._merge_intervals([(5.0, 8.0), (0.0, 5.0)]) == [(0.0, 8.0)]  # unsorted
+    # A real gap is preserved as two disjoint spans.
+    assert pc._merge_intervals([(0.0, 5.0), (10.0, 12.0)]) == [(0.0, 5.0), (10.0, 12.0)]
+
+
+def _smil_doc(pars):
+    """pars: list of (par_id, audio_file, begin, end). Returns SMIL XML text."""
+    body = "".join(
+        f'<par id="{pid}"><text src="../x.xhtml#{pid}"/>'
+        f'<audio clipBegin="{b:.3f}s" clipEnd="{e:.3f}s" src="../audio/{af}"/></par>'
+        for pid, af, b, e in pars
+    )
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<smil version="3.0" xmlns="http://www.w3.org/ns/SMIL" '
+        f'xmlns:epub="http://www.idpf.org/2007/ops"><body><seq>{body}</seq></body></smil>'
+    )
+
+
+def _book_info_with_smils(smil_files, subdir="book [abc123].epubmo/run"):
+    """Write SMIL files into a temp folder whose name contains glob metacharacters
+    (brackets), mirroring the real ".Book [hash].epubmo/run" layout. Returns a
+    book_info pointing at that folder."""
+    root = tempfile.mkdtemp()
+    folder = os.path.join(root, subdir)
+    os.makedirs(folder, exist_ok=True)
+    for name, pars in smil_files.items():
+        with open(os.path.join(folder, name), "w", encoding="utf-8") as f:
+            f.write(_smil_doc(pars))
+    return {"folder_name": folder, "audio_extension": ".m4a"}
+
+
+def test_iter_smil_files_finds_files_in_bracketed_folder():
+    """Regression: glob.escape must be applied so "[hash]" in the path is literal.
+    Without it, glob treats the brackets as a character class and returns zero files,
+    silently skipping every SMIL validation check."""
+    bi = _book_info_with_smils(
+        {"a.smil": [("p1", "000.m4a", 0.0, 5.0)]}
+    )
+    assert pc.iter_smil_files(bi) == ["a.smil"]
+
+
+def test_audio_coverage_gaps_detects_interior_hole():
+    """A file covered 0->10 then 123->200 has a ~113s interior hole -> flagged."""
+    bi = _book_info_with_smils(
+        {
+            "ch.smil": [
+                ("p1", "016.m4a", 0.0, 10.698),
+                ("p2", "016.m4a", 123.931, 200.0),
+            ]
+        }
+    )
+    result = pc.test_audio_coverage_gaps(bi)
+    assert result["ok"] is False
+    assert result["skipped"] is False
+    assert len(result["findings"]) == 1
+    finding = result["findings"][0]
+    assert finding["audio_file"] == "016.m4a"
+    assert finding["gaps"][0]["gap_start"] == 10.698
+    assert finding["gaps"][0]["gap_end"] == 123.931
+    assert abs(finding["gaps"][0]["gap_seconds"] - 113.233) < 1e-6
+
+
+def test_audio_coverage_gaps_passes_when_contiguous():
+    """Contiguous coverage (and cross-file spillover) has no interior gap."""
+    bi = _book_info_with_smils(
+        {
+            "ch.smil": [
+                ("p1", "016.m4a", 0.0, 10.698),
+                # tail spillover from another audio file does not create a gap in 016
+                ("p2", "015.m4a", 1089.0, 1106.245),
+                ("p3", "016.m4a", 10.698, 123.931),
+                ("p4", "016.m4a", 123.931, 200.0),
+            ]
+        }
+    )
+    result = pc.test_audio_coverage_gaps(bi)
+    assert result["ok"] is True
+    assert result["findings"] == []
+
+
+def test_audio_coverage_gaps_ignores_subsecond_gaps():
+    """Sub-threshold gaps (float rounding / tiny gaps) are not flagged."""
+    bi = _book_info_with_smils(
+        {"ch.smil": [("p1", "000.m4a", 0.0, 5.0), ("p2", "000.m4a", 5.4, 10.0)]}
+    )
+    result = pc.test_audio_coverage_gaps(bi)  # 0.4s gap < 1.0s default
+    assert result["ok"] is True
+
+
+def test_audio_coverage_gaps_skips_without_smils():
+    bi = {"folder_name": tempfile.mkdtemp(), "audio_extension": ".m4a"}
+    result = pc.test_audio_coverage_gaps(bi)
+    assert result["skipped"] is True
+    assert result["ok"] is True
+
+
 if __name__ == "__main__":
     from _runner import run_module_tests
 

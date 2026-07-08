@@ -2020,7 +2020,10 @@ def iter_audio_files(book_info):
     if not audio_extension:
         return []
 
-    pattern = os.path.join(get_book_folder(book_info), f"*{audio_extension}")
+    # glob.escape the folder: real book folders contain "[hash]" (e.g.
+    # ".Book [965f3b22].epubmo/run"), and the unescaped brackets are glob
+    # character classes that match nothing, silently returning zero files.
+    pattern = os.path.join(glob.escape(get_book_folder(book_info)), f"*{audio_extension}")
     return sorted(
         name
         for name in (os.path.basename(path) for path in glob.glob(pattern))
@@ -2029,7 +2032,9 @@ def iter_audio_files(book_info):
 
 
 def iter_smil_files(book_info):
-    pattern = os.path.join(get_book_folder(book_info), "*.smil")
+    # See iter_audio_files: escape the folder so "[hash]" in the path is treated
+    # literally instead of as a glob character class.
+    pattern = os.path.join(glob.escape(get_book_folder(book_info)), "*.smil")
     return sorted(os.path.basename(path) for path in glob.glob(pattern))
 
 
@@ -2484,6 +2489,89 @@ def test_low_audio_coverage(
         metrics={
             "substantial_audio_files": len(substantial_audio),
             "coverage_warn_ratio": coverage_warn_ratio,
+        },
+    )
+
+
+def _merge_intervals(intervals):
+    # Merge overlapping/adjacent [begin, end) clip ranges into a sorted, disjoint list.
+    ordered = sorted(intervals)
+    merged = []
+    for begin, end in ordered:
+        if merged and begin <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((begin, end))
+    return merged
+
+
+def test_audio_coverage_gaps(book_info, min_gap_seconds=1.0):
+    # A chapter that straddles an audio-chunk seam is matched from two chunks. A bad
+    # merge can leave a mid-file span referenced by no clip, so that narration is
+    # skipped on playback AND missing from the OPF media:duration total (the number
+    # the reader app displays). test_low_audio_coverage only compares *summed* coverage
+    # to duration, so an 82%-covered file with a large interior hole passes it. This
+    # check inspects contiguity: for every audio file referenced by SMILs it merges the
+    # clip ranges and flags any interior gap between covered spans.
+    smil_files = iter_smil_files(book_info)
+    if not smil_files:
+        return build_check_result(
+            "audio_coverage_gaps",
+            True,
+            "No SMIL files were found to validate.",
+            metrics={"smil_files": 0},
+            skipped=True,
+        )
+
+    smil_data = parse_smil_audio_refs(book_info)
+    intervals_by_audio = defaultdict(list)
+    for ref in smil_data["refs"]:
+        if ref["valid"] and ref["audio_file"]:
+            intervals_by_audio[ref["audio_file"]].append(
+                (ref["clip_begin"], ref["clip_end"])
+            )
+
+    findings = []
+    for audio_file in sorted(intervals_by_audio):
+        merged = _merge_intervals(intervals_by_audio[audio_file])
+        gaps = []
+        for (_, prev_end), (next_begin, _) in zip(merged, merged[1:]):
+            gap = next_begin - prev_end
+            if gap > min_gap_seconds:
+                gaps.append(
+                    {
+                        "gap_start": round(prev_end, 3),
+                        "gap_end": round(next_begin, 3),
+                        "gap_seconds": round(gap, 3),
+                    }
+                )
+        if gaps:
+            findings.append(
+                {
+                    "audio_file": audio_file,
+                    "gap_count": len(gaps),
+                    "total_gap_seconds": round(sum(g["gap_seconds"] for g in gaps), 3),
+                    "gaps": gaps,
+                }
+            )
+
+    total_gap_seconds = round(sum(f["total_gap_seconds"] for f in findings), 3)
+    return build_check_result(
+        "audio_coverage_gaps",
+        ok=not findings,
+        summary=(
+            "No interior coverage gaps were found in any referenced audio file."
+            if not findings
+            else (
+                f"{len(findings)} audio file(s) have interior coverage gaps "
+                f"totaling {total_gap_seconds}s of unreferenced audio."
+            )
+        ),
+        findings=findings,
+        metrics={
+            "referenced_audio_files": len(intervals_by_audio),
+            "min_gap_seconds": min_gap_seconds,
+            "total_gap_seconds": total_gap_seconds,
         },
     )
 
@@ -3024,6 +3112,7 @@ def run_post_checks(
             min_words=min_words,
             coverage_warn_ratio=coverage_warn_ratio,
         ),
+        test_audio_coverage_gaps(book_info),
         test_duplicate_audio_clips(book_info),
         test_overlapping_audio_clips(
             book_info, min_overlap_seconds=min_overlap_seconds
@@ -3049,6 +3138,73 @@ def run_post_checks(
 # === Segment-level alignment and SMIL generation ===
 
 
+def _clip_duration(segment_match):
+    # Real audio span of a finalized segment clip. Used to pick the better of two
+    # clips when the same segment is matched from more than one audio chunk.
+    try:
+        return max(0.0, float(segment_match["end"]) - float(segment_match["start"]))
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+
+
+def resolve_segment_clips(candidate_matches):
+    # candidate_matches: {seg_id: [clip, ...]} where each seg_id may have a clip from
+    # more than one audio chunk (a chapter that straddles a chunk seam is matched from
+    # both the tail of the previous chunk and the body of the next chunk).
+    #
+    # The previous chunk's tail holds only a few seconds of the chapter, but the
+    # aligner + interior-gap fill can cram many seam segments into it -- sometimes with
+    # durations that individually rival the body chunk's real clips. Picking per-segment
+    # by duration therefore still lets a few tail clips win, which punches small holes
+    # in the body audio (that audio is then referenced by no clip and is dropped from
+    # playback and from the media:duration total).
+    #
+    # A chapter's clips overwhelmingly come from one "dominant" audio file (the body).
+    # Resolve every seam segment to that dominant file so the body stays contiguous;
+    # fall back to duration only among clips from the same (dominant) file, or when a
+    # segment was matched solely by a non-dominant chunk (genuine spillover).
+    covered_by_audio = defaultdict(float)
+    for clips in candidate_matches.values():
+        for clip in clips:
+            covered_by_audio[clip.get("audio_file")] += _clip_duration(clip)
+    dominant_audio = (
+        max(covered_by_audio, key=covered_by_audio.get) if covered_by_audio else None
+    )
+
+    resolved = {}
+    for seg_id, clips in candidate_matches.items():
+        dominant_clips = [c for c in clips if c.get("audio_file") == dominant_audio]
+        pool = dominant_clips or clips
+        resolved[seg_id] = max(pool, key=_clip_duration)
+    return resolved
+
+
+def anchor_audio_file_tails(aggregated_matches_by_html, book_info):
+    # For each packaged audio file, find the resolved clip that ends latest and extend
+    # its clipEnd to the file's true duration, so no audio past the last matched
+    # sentence is left uncovered. Mutates the clip dicts in place. Missing/unprobeable
+    # durations are skipped rather than fatal (this runs inside SMIL generation).
+    latest_clip_by_audio = {}
+    for matches in aggregated_matches_by_html.values():
+        for clip in matches.values():
+            audio_file = clip.get("audio_file")
+            if not audio_file:
+                continue
+            current = latest_clip_by_audio.get(audio_file)
+            if current is None or clip["end"] > current["end"]:
+                latest_clip_by_audio[audio_file] = clip
+
+    for audio_file, clip in latest_clip_by_audio.items():
+        try:
+            duration = get_audio_duration(
+                os.path.join(book_info["folder_name"], audio_file), []
+            )
+        except RuntimeError:
+            continue
+        if duration > clip["end"]:
+            clip["end"] = duration
+
+
 def create_smil_files(book_info, skip=True):
     # Output model:
     # one HTML file -> one SMIL file, even when several audio chunks contribute to it.
@@ -3064,6 +3220,8 @@ def create_smil_files(book_info, skip=True):
     }
     matched_html_files = list(dict.fromkeys(item["html_file"] for item in matched_items))
     aggregated_matches_by_html = {html_file: {} for html_file in matched_html_files}
+    # Per html_file: {seg_id: [candidate clip from each contributing chunk]}.
+    candidate_matches_by_html = {}
 
     for json_file, items in tqdm(
         iter_matched_json_groups(matched_items),
@@ -3214,15 +3372,29 @@ def create_smil_files(book_info, skip=True):
             total_duration,
         )
 
+        # Collect every candidate clip per segment. A chapter that straddles an
+        # audio-chunk seam is matched from two chunks (the short tail of the previous
+        # chunk and the body of the next chunk), so a seam segment can get a clip from
+        # each. Winners are resolved after all chunks are processed; see
+        # resolve_segment_clips.
         for segment_match in final_chunk_matches:
-            html_matches = aggregated_matches_by_html.setdefault(
+            candidates = candidate_matches_by_html.setdefault(
                 segment_match["html_file"],
                 {},
             )
-            seg_id = segment_match["id"]
-            if seg_id in html_matches:
-                continue
-            html_matches[seg_id] = segment_match
+            candidates.setdefault(segment_match["id"], []).append(segment_match)
+
+    for html_file, candidates in candidate_matches_by_html.items():
+        aggregated_matches_by_html[html_file] = resolve_segment_clips(candidates)
+
+    # Per-chunk finalize_segment_timestamps anchored each chunk's last segment to that
+    # chunk's full audio duration, so every audio file was fully covered. Resolving
+    # seam segments to their dominant (body) chunk can move the clip that used to end a
+    # "previous chunk" file into a different chunk, leaving that file's tail (the last
+    # sentences a chapter speaks before the chunk boundary) referenced by nothing --
+    # dropped from playback and from the media:duration total. Re-anchor per audio
+    # file: extend the latest-ending clip of each file to the file's real duration.
+    anchor_audio_file_tails(aggregated_matches_by_html, book_info)
 
     for html_file in tqdm(matched_html_files, desc="Writing SMIL", unit="file"):
         smil_filename = make_overlay_basename(html_file)
