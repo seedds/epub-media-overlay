@@ -1379,8 +1379,7 @@ def _load_reference_sets(zip_file, book_info):
     try:
         with zip_file.open(opf_file) as handle:
             opf_soup = BeautifulSoup(handle.read(), "xml")
-        index = build_reference_index(zip_file, opf_soup, opf_dir)
-        return index.referenced_classes, index.referenced_ids
+        return build_reference_index(zip_file, opf_soup, opf_dir)
     except Exception as error:
         warnings.warn(
             f"Could not build EPUB reference index ({error!r}); "

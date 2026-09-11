@@ -36,7 +36,6 @@ import posixpath
 import re
 import warnings
 import zipfile
-from dataclasses import dataclass
 
 import tinycss2
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
@@ -70,14 +69,6 @@ _INERT_CSS_PROPERTIES = {
     "-webkit-text-combine",
     "text-combine-upright",
 }
-
-
-@dataclass(frozen=True)
-class ReferenceIndex:
-    """Sets of class/id names that are referenced somewhere in the EPUB."""
-
-    referenced_classes: frozenset
-    referenced_ids: frozenset
 
 
 def _iter_manifest_sources(opf_soup, opf_dir):
@@ -202,6 +193,16 @@ def _collect_selector_tokens(tokens, classes, ids):
                     classes.add(inner.value)
                     ids.add(inner.value)
             prev_was_dot = False
+        elif ttype == "function":
+            # Functional pseudo-classes carry selectors as arguments: :not(.hidden),
+            # :is(.a, #b), :where(...), :has(> .c). Without recursing, `.hidden` in
+            # `.a:not(.hidden)` is invisible to the index, gets stripped from the
+            # book, and the exclusion silently stops applying.
+            _collect_selector_tokens(token.arguments, classes, ids)
+            prev_was_dot = False
+        elif ttype == "() block":
+            _collect_selector_tokens(token.content, classes, ids)
+            prev_was_dot = False
         else:
             prev_was_dot = False
 
@@ -269,13 +270,17 @@ def _collect_from_html(markup, classes, ids):
 
 
 def build_reference_index(zip_file, opf_soup, opf_dir):
-    """Scan an open EPUB zip and return a ReferenceIndex of referenced class/id names.
+    """Scan an open EPUB zip and return `(referenced_classes, referenced_ids)`.
 
     `zip_file` is an open `zipfile.ZipFile`. `opf_soup` is the parsed OPF and
     `opf_dir` its directory inside the zip, used to resolve manifest hrefs.
     """
     classes = set()
     ids = set()
+
+    # The OPF itself can target ids: EPUB2 <guide><reference href="ch1.xhtml#start"/>.
+    # It is not a manifest item, so scan its markup directly.
+    _collect_fragment_ids(str(opf_soup), ids)
 
     for resolved, kind in _iter_manifest_sources(opf_soup, opf_dir):
         text = _read_zip_text(zip_file, resolved)
@@ -290,7 +295,4 @@ def build_reference_index(zip_file, opf_soup, opf_dir):
         elif kind == "ncx":
             _collect_fragment_ids(text, ids)
 
-    return ReferenceIndex(
-        referenced_classes=frozenset(classes),
-        referenced_ids=frozenset(ids),
-    )
+    return frozenset(classes), frozenset(ids)

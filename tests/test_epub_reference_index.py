@@ -81,6 +81,47 @@ def test_mixed_declarations_count_as_reference():
     assert "x" in classes
 
 
+# --- functional pseudo-class recursion -------------------------------------
+
+
+def test_not_pseudo_class_argument_is_referenced():
+    # Regression: `.hidden` inside :not() was never indexed, so it was stripped and
+    # the exclusion stopped applying.
+    classes, ids = _css_classes(".a:not(.hidden) { color: red }")
+    assert {"a", "hidden"} <= classes
+
+
+def test_is_where_has_arguments_are_referenced():
+    classes, ids = _css_classes(
+        ".b:is(.x, #y) { margin: 0 } .c:where(.w) { padding: 0 } .d:has(> .z) { color: blue }"
+    )
+    assert {"x", "w", "z"} <= classes
+    assert "y" in ids
+
+
+def test_nested_functional_pseudo_classes_recurse():
+    classes, ids = _css_classes(".a:not(:is(.deep, .deeper)) { color: red }")
+    assert {"deep", "deeper"} <= classes
+
+
+# --- OPF guide fragments ---------------------------------------------------
+
+
+def test_opf_guide_fragment_ids_are_referenced():
+    import io
+
+    opf = (
+        '<package xmlns="http://www.idpf.org/2007/opf"><manifest/>'
+        '<guide><reference type="text" href="ch1.xhtml#start"/></guide></package>'
+    )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as zf:
+        zf.writestr("content.opf", opf)
+    with zipfile.ZipFile(buffer) as zf:
+        classes, ids = eri.build_reference_index(zf, BeautifulSoup(opf, "xml"), ".")
+    assert "start" in ids
+
+
 # --- at-rule (conditional group) recursion --------------------------------
 
 
@@ -226,16 +267,16 @@ def test_foundation_reference_index_classifies_correctly():
             print("SKIP: Foundation EPUB not available")
             return
 
-    index = _build_foundation_index()
+    referenced_classes, referenced_ids = _build_foundation_index()
 
     # koboSpan is only ever styled by an inert no-op rule -> not referenced.
-    assert "koboSpan" not in index.referenced_classes
+    assert "koboSpan" not in referenced_classes
     # Real content classes from the external stylesheet -> referenced.
-    assert {"chapter", "center", "extract", "fn"} <= index.referenced_classes
+    assert {"chapter", "center", "extract", "fn"} <= referenced_classes
     # Chapter nav anchors targeted by nav/NCX/TOC -> referenced.
-    assert {"c39", "c07"} <= index.referenced_ids
+    assert {"c39", "c07"} <= referenced_ids
     # Ids used only by kobo.js -> referenced via the JS scan.
-    assert {"book-columns", "book-inner"} <= index.referenced_ids
+    assert {"book-columns", "book-inner"} <= referenced_ids
     # Individual kobo span ids are targeted by nothing.
-    assert "kobo.1.1" not in index.referenced_ids
+    assert "kobo.1.1" not in referenced_ids
 
