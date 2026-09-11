@@ -280,6 +280,16 @@ def plan_audio_chunks(book_info, audio_path=None):
             merged[-2]["end_time"] = merged[-1]["end_time"]
             merged.pop()
 
+        # Chapter markers rarely start exactly at 0 or end exactly at the stream end.
+        # Audio outside [first.start, last.end] would otherwise never be cut,
+        # transcribed, or packaged. Snap the edges to the audio stream (the same
+        # probe the completeness check uses), ignoring sub-second drift.
+        if merged[0]["start_time"] > 0.5:
+            merged[0]["start_time"] = 0.0
+        stream_duration = get_primary_audio_stream_duration(str(audio_path))
+        if stream_duration is not None and stream_duration - merged[-1]["end_time"] > 0.5:
+            merged[-1]["end_time"] = stream_duration
+
         return [
             {
                 "id": idx,
@@ -626,7 +636,7 @@ def is_transcript_complete(book_info, chunk_basename):
     different model/language/chunking is re-derived instead of silently reused.
     """
     chunk_path = resolve_book_path(book_info, chunk_basename)
-    json_basename = chunk_basename.replace(book_info["audio_extension"], ".json")
+    json_basename = transcript_basename(chunk_basename, book_info["audio_extension"])
     json_path = resolve_book_path(book_info, json_basename)
     if not os.path.exists(json_path):
         return False
@@ -732,6 +742,51 @@ def split_audio_chunk(book_info, chunk_info):
         raise RuntimeError(f"ffmpeg created an invalid audio chunk: {out_name}")
 
 
+def planned_chunk_basenames(book_info):
+    """Chunk file basenames (`NNN<ext>`) from the current chunk plan.
+
+    Every stage after split derives its chunk/transcript list from this, never from
+    what happens to be on disk, so files left by an older plan cannot leak into
+    transcription, matching, or packaging.
+    """
+    return [chunk["output_name"] for chunk in plan_audio_chunks(book_info)]
+
+
+def transcript_basename(chunk_basename, audio_extension):
+    return chunk_basename[: -len(audio_extension)] + ".json"
+
+
+_STALE_CHUNK_RE_TEMPLATE = r"^(\d{{3,}})(?:{ext}|\.json)(?:\.meta)?$"
+
+
+def prune_stale_chunk_artifacts(book_info, chunk_plan):
+    """Delete chunk files, transcripts and stamps whose ordinal is not in the plan.
+
+    Chunks and transcripts are preserved across signature changes because they are
+    expensive, but a plan change (new audio, different --chunk-seconds) can leave
+    `NNN.*` files beyond the new plan. Left alone they were re-transcribed (stale
+    stamp), matched, packaged and declared in the OPF. Returns the number of stale
+    ordinals removed.
+    """
+    audio_extension = book_info["audio_extension"]
+    folder = get_book_folder(book_info)
+    planned_ordinals = {
+        os.path.splitext(chunk["output_name"])[0] for chunk in chunk_plan
+    }
+    # Never touch the copied source audiobook, even if its name looks chunk-like.
+    protected = {os.path.basename(book_info.get("audio_file") or "")}
+    pattern = re.compile(_STALE_CHUNK_RE_TEMPLATE.format(ext=re.escape(audio_extension)))
+
+    stale_ordinals = set()
+    for name in sorted(os.listdir(folder)):
+        match = pattern.match(name)
+        if not match or name in protected or match.group(1) in planned_ordinals:
+            continue
+        os.remove(os.path.join(folder, name))
+        stale_ordinals.add(match.group(1))
+    return len(stale_ordinals)
+
+
 def split_audio(book_info):
     # The chapter markers embedded in the audiobook are useful for creating chunks, but
     # they are not trusted as final semantic matches to the book text. They simply give
@@ -742,6 +797,7 @@ def split_audio(book_info):
         "reused_chunk_count": 0,
         "regenerated_chunk_count": 0,
         "created_chunk_count": 0,
+        "pruned_chunk_count": prune_stale_chunk_artifacts(book_info, chunk_plan),
     }
     pending_chunks = []
 
@@ -796,11 +852,11 @@ def transcribe_audio(book_info):
     batch_size = int(book_info.get("batch_size") or 1)
 
     for file in tqdm(
-        sorted_chunk_files(book_info["audio_extension"]),
+        planned_chunk_basenames(book_info),
         desc="Transcribing audio",
         unit="chunk",
     ):
-        json_file = file.replace(book_info["audio_extension"], ".json")
+        json_file = transcript_basename(file, book_info["audio_extension"])
         # Skip only if a prior transcript exists AND its stamp matches the current
         # model/language/backend AND references the current chunk stamp. A stampless
         # or mismatched transcript (different config, or a crash-truncated file that
@@ -1081,7 +1137,14 @@ def link_html_with_audio(book_info):
     # Current policy prefers lexical overlap plus local token-order agreement over
     # embedding-only matching because short openings and chapter headers are noisy.
     matched_list = []
-    json_files = sorted(glob.glob("*.json"))
+    # Transcripts are addressed via the chunk plan, not a directory glob, so a stale
+    # NNN.json from an older plan is never matched. A planned transcript that is
+    # missing is skipped here and reported by validation (missing_transcripts).
+    json_files = [
+        transcript_basename(name, book_info["audio_extension"])
+        for name in planned_chunk_basenames(book_info)
+    ]
+    json_files = [name for name in json_files if os.path.exists(name)]
     last_global_index = 0
     # Spine order of the most recently accepted match. Used as a hard forward-order
     # gate for the short-page fallback so a divider page can never be linked out of
@@ -1102,9 +1165,7 @@ def link_html_with_audio(book_info):
     }
 
     if not json_files:
-        print(
-            "❌ No JSON files found in current directory. Matched list will be empty."
-        )
+        print("❌ No transcript files exist for the chunk plan. Matched list will be empty.")
         return []
 
     for json_file in tqdm(json_files, desc="Matching transcripts", unit="file"):
@@ -1982,19 +2043,6 @@ CHUNK_BASENAME_RE = re.compile(r"^\d{3,}\.[^.]+$")
 def is_chunk_basename(name, audio_extension):
     """True if `name` is a split audio chunk (NNN<ext>) for the given extension."""
     return bool(CHUNK_BASENAME_RE.match(name)) and name.endswith(audio_extension)
-
-
-def sorted_chunk_files(audio_extension):
-    """Sorted split-audio chunk basenames in the current working directory.
-
-    Excludes the copied source audiobook (and any other stray audio file) so only
-    genuine `NNN<ext>` chunks are transcribed / matched / packaged.
-    """
-    return sorted(
-        name
-        for name in glob.glob(f"*{audio_extension}")
-        if is_chunk_basename(name, audio_extension)
-    )
 
 
 # EPUB manifest media-type by audio file extension. The packaged chunk extension is
@@ -3489,8 +3537,9 @@ def merge_files(book_info):
     )
 
     with zipfile.ZipFile(book_info["out_file"], "a") as f:
-        # Package only the split chunks, never the copied source audiobook.
-        for file in sorted_chunk_files(book_info["audio_extension"]):
+        # Package exactly the planned chunks, never the copied source audiobook or a
+        # stale chunk from an older plan.
+        for file in planned_chunk_basenames(book_info):
             f.write(file, f"audio/{file}")
 
         for file in sorted(glob.glob("*.smil")):
@@ -3591,8 +3640,8 @@ def post_processing_opf(book_info):
                     nav_points,
                 )
 
-        # Declare all packaged split-audio files (chunks only, not the source copy).
-        for file_name in sorted_chunk_files(book_info["audio_extension"]):
+        # Declare all packaged split-audio files (the planned chunks only).
+        for file_name in planned_chunk_basenames(book_info):
             item = soup.new_tag(
                 "item",
                 attrs={

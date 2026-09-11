@@ -6,7 +6,7 @@ Covers regressions:
     pretty-print round-trip);
   - audio_media_type must reflect the configured extension, not a hardcoded
     "audio/mp4";
-  - sorted_chunk_files / is_chunk_basename must select only NNN<ext> chunks, never
+  - iter_audio_files / is_chunk_basename must select only NNN<ext> chunks, never
     the copied source audiobook;
   - get_audio_duration must raise (not silently return 0.0) when it cannot determine
     a duration and no fallback timing is available.
@@ -79,20 +79,10 @@ def test_is_chunk_basename_selects_only_numbered_chunks():
     assert not pc.is_chunk_basename("000.mp3", ".m4a")
 
 
-def test_sorted_chunk_files_excludes_source():
-    import os
-    import tempfile
-
-    with tempfile.TemporaryDirectory() as folder:
-        for name in ("000.m4a", "001.m4a", "MyBook.m4a", "notes.txt"):
-            with open(os.path.join(folder, name), "wb") as handle:
-                handle.write(b"\x00")
-        cwd = os.getcwd()
-        try:
-            os.chdir(folder)
-            chunks = pc.sorted_chunk_files(".m4a")
-        finally:
-            os.chdir(cwd)
+def test_iter_audio_files_excludes_source(tmp_path):
+    for name in ("000.m4a", "001.m4a", "MyBook.m4a", "notes.txt"):
+        (tmp_path / name).write_bytes(b"\x00")
+    chunks = pc.iter_audio_files({"folder_name": str(tmp_path), "audio_extension": ".m4a"})
     assert chunks == ["000.m4a", "001.m4a"]
 
 
