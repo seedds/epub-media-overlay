@@ -199,3 +199,43 @@ def test_package_reconcile_accepts_only_the_recorded_bytes(tmp_path):
     _processed_epub(paths.packaged_epub_path, marker=b"changed")
     _processed_epub(paths.output_path, marker=b"changed")
     assert geo.reconcile_stage_from_artifacts("package", config, paths, state, pc) is None
+
+
+# --- match reconcile -------------------------------------------------------
+
+
+def _state_for_match(config, paths, matched, audio_files, recorded):
+    state = _prepared_state(config, paths)
+    state["artifacts"]["audio_files"] = audio_files
+    if recorded is not None:
+        state["artifacts"]["match_transcript_files"] = recorded
+    paths.matched_list_path.write_text(json.dumps(matched))
+    return state
+
+
+def test_match_reconcile_accepts_unmatched_intro_transcript(tmp_path):
+    # 000.json (an intro chunk) matched nothing; the match is still complete.
+    config, paths = _config_and_paths(tmp_path)
+    matched = [{"json_file": "001.json", "html_file": "OEBPS/ch1.xhtml"}]
+    state = _state_for_match(
+        config, paths, matched, ["000.m4a", "001.m4a"], ["000.json", "001.json"]
+    )
+    result = geo.reconcile_stage_from_artifacts("match", config, paths, state, pc)
+    assert result is not None and result["match_count"] == 1
+
+
+def test_match_reconcile_rejects_when_transcript_set_changed(tmp_path):
+    config, paths = _config_and_paths(tmp_path)
+    matched = [{"json_file": "001.json", "html_file": "OEBPS/ch1.xhtml"}]
+    # A third transcript appeared since the match ran.
+    state = _state_for_match(
+        config, paths, matched, ["000.m4a", "001.m4a", "002.m4a"], ["000.json", "001.json"]
+    )
+    assert geo.reconcile_stage_from_artifacts("match", config, paths, state, pc) is None
+
+
+def test_match_reconcile_rejects_without_recorded_inputs(tmp_path):
+    config, paths = _config_and_paths(tmp_path)
+    matched = [{"json_file": "001.json", "html_file": "OEBPS/ch1.xhtml"}]
+    state = _state_for_match(config, paths, matched, ["000.m4a", "001.m4a"], None)
+    assert geo.reconcile_stage_from_artifacts("match", config, paths, state, pc) is None

@@ -913,7 +913,13 @@ def reconcile_stage_from_artifacts(
         if not audio_files:
             audio_files, _chunks = expected_audio_files(legacy, book_info, paths.run_dir)
         transcript_files = expected_transcript_files(audio_files)
-        if sorted(matched_json_files(matched_list, legacy)) != sorted(transcript_files):
+        # The match is reusable only if it was computed over exactly the current
+        # transcript set. Some transcripts legitimately match nothing (intro/outro
+        # chunks), so "every transcript appears in the matched list" is the wrong
+        # test; compare against the input list the match stage recorded instead.
+        if state.get("artifacts", {}).get("match_transcript_files") != transcript_files:
+            return None
+        if not set(matched_json_files(matched_list, legacy)) <= set(transcript_files):
             return None
         html_files = matched_html_files(matched_list, legacy)
         state.setdefault("artifacts", {})["audio_files"] = audio_files
@@ -1079,12 +1085,14 @@ def run_split_stage(
     reused_chunk_count = split_stats.get("reused_chunk_count", 0)
     regenerated_chunk_count = split_stats.get("regenerated_chunk_count", 0)
     created_chunk_count = split_stats.get("created_chunk_count", 0)
+    pruned_chunk_count = split_stats.get("pruned_chunk_count", 0)
     logger.info(
-        "Audio split complete with %d chunk(s) (%d reused, %d regenerated, %d created)",
+        "Audio split complete with %d chunk(s) (%d reused, %d regenerated, %d created, %d stale pruned)",
         len(audio_files),
         reused_chunk_count,
         regenerated_chunk_count,
         created_chunk_count,
+        pruned_chunk_count,
     )
     return {
         "audio_files": audio_files,
@@ -1092,6 +1100,7 @@ def run_split_stage(
         "reused_chunk_count": reused_chunk_count,
         "regenerated_chunk_count": regenerated_chunk_count,
         "created_chunk_count": created_chunk_count,
+        "pruned_chunk_count": pruned_chunk_count,
     }
 
 
@@ -1141,6 +1150,8 @@ def run_match_stage(
     atomic_write_json(paths.matched_list_path, matched_list)
     html_files = matched_html_files(matched_list, legacy)
     state["artifacts"]["matched_html_files"] = html_files
+    audio_files, _chunks = expected_audio_files(legacy, book_info, paths.run_dir)
+    state["artifacts"]["match_transcript_files"] = expected_transcript_files(audio_files)
     logger.info("Matching complete with %d transcript-to-HTML links", len(matched_list))
     return {"match_count": len(matched_list), "html_files": html_files}
 
