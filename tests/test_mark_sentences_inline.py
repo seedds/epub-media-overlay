@@ -159,3 +159,37 @@ def test_css_link_added_once():
     out = ms.mark_sentences(out, "y", css_href="../readaloud.css")
     links = BeautifulSoup(out, "lxml").find_all("link", href="../readaloud.css")
     assert len(links) == 1
+
+
+# --- zero-width (empty anchor) placement -------------------------------------
+
+
+def _body(out):
+    return BeautifulSoup(out, "lxml").body
+
+
+def test_anchor_on_segment_boundary_emitted_once_without_empty_wrapper():
+    # The boundary after "here. " lands exactly on the anchor. It used to be
+    # appended to both neighbouring segments, leaving an empty <em></em> behind.
+    html = (
+        "<html><body><p><em>First sentence here. "
+        '<a id="fn1"></a>Second sentence here.</em></p></body></html>'
+    )
+    body = _body(ms.mark_sentences(html, "x", referenced_ids=frozenset({"fn1"}), referenced_classes=frozenset()))
+    assert len(body.find_all("a")) == 1
+    assert not [e for e in body.find_all("em") if not e.get_text() and e.find(True) is None]
+
+
+def test_anchor_at_end_of_block_survives():
+    html = '<html><body><p>Only sentence here.<a id="end"></a></p></body></html>'
+    body = _body(ms.mark_sentences(html, "x", referenced_ids=frozenset({"end"}), referenced_classes=frozenset()))
+    anchor = body.find("a", id="end")
+    assert anchor is not None
+    assert anchor.find_parent("span")["id"].startswith("cx-segment")
+
+
+def test_anchor_inside_segment_keeps_position():
+    html = '<html><body><p>Alpha <a id="mid"></a>beta gamma delta.</p></body></html>'
+    body = _body(ms.mark_sentences(html, "x", referenced_ids=frozenset({"mid"}), referenced_classes=frozenset()))
+    text_after = body.find("a", id="mid").next_sibling
+    assert str(text_after).startswith("beta")

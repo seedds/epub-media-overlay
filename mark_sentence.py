@@ -675,6 +675,8 @@ def _process_element_preserve_structure(
     new_content = _create_segment_spans(
         boundaries, char_map, zero_width_nodes, chapter_id, counter
     )
+    if not new_content:
+        return counter
 
     # Step 4: replace subtree contents only after reconstruction succeeds.
     counter += len(new_content)
@@ -820,11 +822,16 @@ def _create_segment_spans(
             segment_span.append(wrapped_node)
             current_idx = next_idx
 
-        # Emit zero-width nodes that land exactly on the right boundary.
-        for node, fmt_stack in zero_width_lookup.get(end, []):
-            segment_span.append(_wrap_with_format_stack(node, fmt_stack))
-
         new_content.append(segment_span)
+
+    # Zero-width nodes at the very end of the block (offset == text length) belong
+    # to no visible position; emit them once, after the last segment's content.
+    # (Emitting at each segment's `end` as well used to append the same node twice
+    # when a boundary fell exactly on an anchor: bs4 moved the node on the second
+    # append and left an empty formatting wrapper behind in the earlier segment.)
+    if new_content:
+        for node, fmt_stack in zero_width_lookup.get(len(char_map), []):
+            new_content[-1].append(_wrap_with_format_stack(node, fmt_stack))
 
     return new_content
 
