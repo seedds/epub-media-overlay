@@ -78,9 +78,9 @@ def align(html_tokens, audio_tokens, segments):
         [t["token"] for t in audio_tokens],
         autojunk=False,
     )
-    raw_matches, *_ = pc.build_raw_matches(
-        matcher.get_opcodes(), html_tokens, audio_tokens
-    )
+    raw_matches = pc.build_raw_matches(matcher.get_opcodes(), html_tokens, audio_tokens)[
+        "raw_matches"
+    ]
     matched = pc.build_segment_match_list(raw_matches, segments)
     return pc.fill_interior_segment_gaps(matched, segments)
 
@@ -343,9 +343,9 @@ def test_fill_noop_when_all_matched():
         [t["token"] for t in audio_tokens_from(words)],
         autojunk=False,
     )
-    raw, *_ = pc.build_raw_matches(
+    raw = pc.build_raw_matches(
         matcher.get_opcodes(), html_tokens_from(spec), audio_tokens_from(words)
-    )
+    )["raw_matches"]
     matched = pc.build_segment_match_list(raw, segments)
     filled = pc.fill_interior_segment_gaps(matched, segments)
     assert len(filled) == len(matched) == 2
@@ -542,7 +542,7 @@ def test_envelope_is_min_start_max_end():
         [t["token"] for t in audio_tokens],
         autojunk=False,
     )
-    raw, *_ = pc.build_raw_matches(matcher.get_opcodes(), html_tokens, audio_tokens)
+    raw = pc.build_raw_matches(matcher.get_opcodes(), html_tokens, audio_tokens)["raw_matches"]
     assert raw["s"]["start"] == 5.0
     assert raw["s"]["end"] == 7.5
 
@@ -659,21 +659,8 @@ def test_probe_contains_page_prefix_header_skip_bounded():
     assert not pc.probe_contains_page_prefix(probe, page)
 
 
-def select_short_page_match(probe_tokens, candidates, last_matched_html_order):
-    """Reimplementation of the short-page fallback decision in link_html_with_audio
-    (the `else` branch): pick the first short-page candidate that is in forward order
-    and whose heading is spoken at the probe start. Kept in sync with pipeline_core.
-
-    Returns the chosen candidate dict or None.
-    """
-    for candidate in candidates:
-        if not pc.is_short_page_candidate(candidate):
-            continue
-        if candidate["html_order"] < last_matched_html_order:
-            continue
-        if pc.probe_contains_page_prefix(probe_tokens, candidate["window_tokens"]):
-            return candidate
-    return None
+# The short-page fallback decision is the real pipeline_core function, not a copy.
+select_short_page_match = pc.select_short_page_match
 
 
 def _part6_candidate():
@@ -915,7 +902,7 @@ def test_anchor_audio_file_tails_extends_last_clip_to_duration(monkeypatch):
     runs to 1106.245; the ~17s of "...my god, it's Armstrong" must not be dropped.
     """
     durations = {"015.m4a": 1106.245, "016.m4a": 636.714}
-    monkeypatch.setattr(pc, "get_audio_duration", lambda path, _f: durations[os.path.basename(path)])
+    monkeypatch.setattr(pc, "get_audio_duration", lambda path: durations[os.path.basename(path)])
 
     ch15_last = {"id": "s639", "audio_file": "015.m4a", "start": 1080.0, "end": 1089.076}
     aggregated = {
@@ -935,7 +922,7 @@ def test_anchor_audio_file_tails_extends_last_clip_to_duration(monkeypatch):
 
 
 def test_anchor_audio_file_tails_skips_unprobeable(monkeypatch):
-    def _raise(path, _f):
+    def _raise(path):
         raise RuntimeError("ffprobe failed")
 
     monkeypatch.setattr(pc, "get_audio_duration", _raise)
@@ -1066,3 +1053,74 @@ def test_finalize_clamps_non_monotonic_starts():
     assert_no_overlapping_clips(final)
     assert [item["start"] for item in final] == [0.0, 4.0, 4.0, 8.0]
     assert final[-1]["end"] == 10.0
+
+
+# --- align_tokens: the one HTML<->audio alignment entry point -----------------
+
+
+def _alignment_fixture():
+    words = [f"w{i}" for i in range(60)]
+    html_tokens = [
+        {"token": w, "seg_id": f"s{i // 10}", "seg_index": i // 10} for i, w in enumerate(words)
+    ]
+    # Audio narrates tokens 20..39 (segments s2 and s3), one second per word.
+    audio_tokens = [
+        {"token": words[i], "word": words[i], "start": float(k), "end": float(k) + 0.9}
+        for k, i in enumerate(range(20, 40))
+    ]
+    return html_tokens, audio_tokens
+
+
+def test_align_tokens_times_segments_with_absolute_indices():
+    html_tokens, audio_tokens = _alignment_fixture()
+    result = pc.align_tokens(
+        html_tokens, audio_tokens, 0, len(audio_tokens) - 1, window_start=20, window_end=40
+    )
+    assert result["matched_token_count"] == 20
+    assert set(result["raw_matches"]) == {"s2", "s3"}
+    assert result["raw_matches"]["s2"]["start"] == 0.0
+    assert result["raw_matches"]["s3"]["end"] == 19.9
+    assert (result["min_audio_idx"], result["max_audio_idx"]) == (0, 19)
+    assert result["max_html_idx"] == 39
+
+
+def test_align_tokens_recovers_from_a_bad_window_hint():
+    html_tokens, audio_tokens = _alignment_fixture()
+    # Hint points at the wrong end of a long document; the widening ranges still find it.
+    long_html = html_tokens + [
+        {"token": f"x{i}", "seg_id": "tail", "seg_index": 6} for i in range(3000)
+    ]
+    result = pc.align_tokens(
+        long_html, audio_tokens, 0, len(audio_tokens) - 1, window_start=2900, window_end=3060
+    )
+    assert result["matched_token_count"] == 20
+
+
+def test_align_tokens_prefix_only_and_audio_slice_offsets():
+    html_tokens, audio_tokens = _alignment_fixture()
+    # Only the second half of the audio (absolute indices 10..19) is aligned; the
+    # returned audio indices must stay absolute.
+    result = pc.align_tokens(
+        html_tokens, audio_tokens, 10, 19, window_start=0, window_end=0, prefix_only=True
+    )
+    assert result["matched_token_count"] == 10
+    assert (result["min_audio_idx"], result["max_audio_idx"]) == (10, 19)
+    assert set(result["raw_matches"]) == {"s3"}
+
+
+def test_align_tokens_without_seg_ids_only_reports_stats():
+    # The coarse matcher's HTML tokens carry no seg_id.
+    html_tokens = [{"display": f"w{i}", "token": f"w{i}"} for i in range(30)]
+    audio_tokens = [
+        {"token": f"w{i}", "word": f"w{i}", "start": float(i), "end": float(i) + 0.5}
+        for i in range(10, 20)
+    ]
+    result = pc.align_tokens(html_tokens, audio_tokens, 0, 9, window_start=0, window_end=30)
+    assert result["raw_matches"] == {}
+    assert result["matched_token_count"] == 10
+    assert result["max_html_idx"] == 19
+
+
+def test_align_tokens_empty_inputs():
+    assert pc.align_tokens([], [{"token": "a", "word": "a", "start": 0, "end": 1}], 0, 0, window_start=0, window_end=0) is None
+    assert pc.align_tokens([{"token": "a"}], [], 0, -1, window_start=0, window_end=0) is None

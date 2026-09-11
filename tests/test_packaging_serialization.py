@@ -9,7 +9,7 @@ Covers regressions:
   - iter_audio_files / is_chunk_basename must select only NNN<ext> chunks, never
     the copied source audiobook;
   - get_audio_duration must raise (not silently return 0.0) when it cannot determine
-    a duration and no fallback timing is available.
+    a duration.
 
 Run:
   pytest tests/test_packaging_serialization.py -q
@@ -118,23 +118,15 @@ def test_missing_transcripts_skips_only_when_no_chunks():
 # --- get_audio_duration (Part C) ------------------------------------------
 
 
-def test_get_audio_duration_raises_without_fallback_on_probe_failure():
-    # A nonexistent path makes ffprobe fail; with no fallback matches this must raise
-    # rather than silently returning 0.0 (which would drop a chunk's final segment).
+def test_get_audio_duration_raises_on_probe_failure():
+    # A nonexistent path makes ffprobe fail; this must raise rather than silently
+    # returning 0.0 (which would drop a chunk's final segment).
     raised = False
     try:
-        pc.get_audio_duration("/definitely/not/a/real/audio/file.m4a", [])
+        pc.get_audio_duration("/definitely/not/a/real/audio/file.m4a")
     except RuntimeError:
         raised = True
     assert raised
-
-
-def test_get_audio_duration_uses_fallback_when_available():
-    # With a fallback, the probe failure degrades gracefully (last end + 1.0).
-    result = pc.get_audio_duration(
-        "/definitely/not/a/real/audio/file.m4a", [{"end": 12.0}]
-    )
-    assert result == 13.0
 
 
 
