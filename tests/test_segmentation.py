@@ -270,6 +270,15 @@ CASES: list[tuple[str, list[str]]] = [
 ]
 
 
+def test_straight_single_quote_closes_and_later_breaks_resume():
+    # With straight quotes, the closing ' used to leave the quote level open and
+    # suppress every later comma/paren break in the sentence.
+    text = "'Come here,' she said, and then (quietly) she left."
+    segments = _segments(text)
+    assert "'Come here,' " in segments
+    assert any(seg.startswith("(quietly)") for seg in segments)
+
+
 def _segments(text: str) -> list[str]:
     boundaries = _get_sentence_aware_segment_boundaries(text, LANGUAGE, MIN_WORDS)
     return [text[start:end] for start, end in boundaries]

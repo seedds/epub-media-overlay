@@ -193,3 +193,23 @@ def test_anchor_inside_segment_keeps_position():
     body = _body(ms.mark_sentences(html, "x", referenced_ids=frozenset({"mid"}), referenced_classes=frozenset()))
     text_after = body.find("a", id="mid").next_sibling
     assert str(text_after).startswith("beta")
+
+
+# --- every container inside a leaf block is preserved ------------------------
+
+
+def test_unlisted_inline_tag_survives_segmentation():
+    out = _segmented("<p>An <acronym title='x'>ABC</acronym> appears in this long sentence here.</p>")
+    assert _tag_count(out, "acronym") == 1
+
+
+def test_table_cells_are_segmented():
+    out = ms.mark_sentences(
+        "<html><body><table><tr><td>First cell text.</td><th>Header</th></tr>"
+        "<caption>A caption.</caption></table></body></html>",
+        "x",
+    )
+    soup = BeautifulSoup(out, "lxml")
+    assert soup.td.find("span", id=lambda v: v and "-segment" in v) is not None
+    assert soup.th.find("span", id=lambda v: v and "-segment" in v) is not None
+    assert soup.caption.find("span", id=lambda v: v and "-segment" in v) is not None

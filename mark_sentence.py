@@ -286,6 +286,9 @@ VOID_TAGS = {
     "iframe",
 }
 
+# Inline formatting tags. Used only by the redundant-markup cleanup to decide which
+# empty, attribute-free leftovers may be removed; reconstruction re-emits *every*
+# container found inside a leaf block regardless of this list.
 INLINE_TAGS = {
     "span",
     "em",
@@ -319,10 +322,6 @@ INLINE_TAGS = {
     "time",
     "label",
     "button",
-    # HTML5 inline elements that were missing: without these, an unlisted inline tag
-    # is walked transparently and never re-emitted during segment reconstruction, so
-    # e.g. <s>$50</s> silently loses its strikethrough. `strike`/`del` above already
-    # cover the deprecated/other strike-through spellings; `s` is the HTML5 one.
     "s",
     "bdi",
     "data",
@@ -577,6 +576,9 @@ def mark_sentences(
         "dd",
         "dt",
         "figcaption",
+        "td",
+        "th",
+        "caption",
     ]
 
     for elem in soup.find_all(block_tags):
@@ -720,10 +722,11 @@ def _build_char_map(
                 # Case B: preserved zero-width structural tag.
                 zero_width_nodes.append((len(char_map), _clone_tag_shell(node), stack[:]))
             else:
-                # Case C: ordinary container tag. Inline containers extend the active
-                # formatting stack for descendants.
+                # Case C: container tag. Inside a leaf block every container is a
+                # formatting wrapper, so it always extends the active stack. (An
+                # allowlist here silently dropped any tag it did not name, e.g. <s>.)
                 new_stack = stack[:]
-                if node.name in INLINE_TAGS:
+                if node is not element:
                     new_stack.append(node)
                 for child in node.children:
                     walk(child, new_stack)
@@ -1068,15 +1071,26 @@ def _get_segment_boundaries_in_sentence(sentence_text: str) -> List[Tuple[int, i
                 and sentence_text[i + 1].islower()
             ):
                 is_quote = False
-            if is_quote:
+            # A straight quote closes an open single-quoted run when it ends a word
+            # (next char is not a letter/digit); otherwise a straight ' never closed
+            # the run and suppressed every later phrase break in the sentence.
+            closes_straight = (
+                c == "'"
+                and single_quote_level > 0
+                and i > 0
+                and not sentence_text[i - 1].isspace()
+                and (i == n - 1 or not sentence_text[i + 1].isalnum())
+            )
+            if is_quote or closes_straight:
                 if (
                     c in ["'", "‘"]
                     and single_quote_level == 0
                     and double_quote_level == 0
+                    and not closes_straight
                 ):
                     breaks.append(i)
                     single_quote_level += 1
-                elif c in ["’"] and single_quote_level > 0:
+                elif (c == "’" or closes_straight) and single_quote_level > 0:
                     single_quote_level -= 1
                     if single_quote_level == 0 and double_quote_level == 0:
                         j = i + 1

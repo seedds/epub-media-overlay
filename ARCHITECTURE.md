@@ -269,7 +269,13 @@ agree on what a "token" is.
   - *Reconstruct* rebuilds spans from the boundaries + `char_map`, re-inserts the
     zero-width nodes at their exact offsets, groups contiguous same-format runs
     into single text nodes (no per-character "span soup"), and avoids
-    whitespace-only wrapper tags that serialize inconsistently.
+    whitespace-only wrapper tags that serialize inconsistently. Every container
+    found inside a leaf block is treated as a formatting wrapper and re-emitted
+    (an allowlist used to drop unlisted tags silently); `INLINE_TAGS` now only
+    tells the cleanup which empty leftovers may be removed.
+  - Leaf blocks include table cells and captions (`td`, `th`, `caption`) so table
+    text is highlightable; a block whose direct children include another block
+    is skipped in favour of its children.
   - The document is parsed once; its visible text is captured *before* cleanup and
     compared with the final DOM, so a cleanup pass that altered text is caught,
     not only a segmentation error.
