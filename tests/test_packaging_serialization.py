@@ -86,7 +86,7 @@ def test_iter_audio_files_excludes_source(tmp_path):
     assert chunks == ["000.m4a", "001.m4a"]
 
 
-# --- test_missing_transcripts honors audio_extension (F8) ------------------
+# --- check_missing_transcripts honors audio_extension (F8) -----------------
 
 
 def test_missing_transcripts_detects_non_m4a_extension():
@@ -100,7 +100,7 @@ def test_missing_transcripts_detects_non_m4a_extension():
             with open(os.path.join(folder, name), "wb") as handle:
                 handle.write(b"\x00")
         book_info = {"folder_name": folder, "audio_extension": ".aac"}
-        result = pc.test_missing_transcripts(book_info)
+        result = pc.check_missing_transcripts(pc.get_audio_inventory(book_info))
     assert result["skipped"] is False
     assert result["ok"] is False
 
@@ -110,7 +110,7 @@ def test_missing_transcripts_skips_only_when_no_chunks():
 
     with tempfile.TemporaryDirectory() as folder:
         book_info = {"folder_name": folder, "audio_extension": ".aac"}
-        result = pc.test_missing_transcripts(book_info)
+        result = pc.check_missing_transcripts(pc.get_audio_inventory(book_info))
     assert result["skipped"] is True
     assert result["ok"] is True
 
@@ -223,3 +223,47 @@ def test_merge_and_opf_rewrite_package_to_explicit_path(tmp_path, monkeypatch):
     assert html_item["media-overlay"] == pc.make_overlay_id("OEBPS/ch1.xhtml")
     durations = [m.get_text() for m in opf.find_all("meta", attrs={"property": "media:duration"})]
     assert durations == ["0:00:02.500", "0:00:02.500"]
+
+
+# --- find_opf_path -----------------------------------------------------------
+
+
+def test_find_opf_path_prefers_container_rootfile(tmp_path):
+    import zipfile
+
+    path = tmp_path / "book.epub"
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("aaa_first.opf", "<package/>")  # sorts first; not the real one
+        zf.writestr("OEBPS/content.opf", "<package/>")
+        zf.writestr(
+            "META-INF/container.xml",
+            '<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+            '<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>'
+            "</rootfiles></container>",
+        )
+    with zipfile.ZipFile(path) as zf:
+        assert pc.find_opf_path(zf) == "OEBPS/content.opf"
+
+
+def test_find_opf_path_falls_back_without_container(tmp_path):
+    import zipfile
+
+    path = tmp_path / "book.epub"
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("OEBPS/content.opf", "<package/>")
+        zf.writestr("OEBPS/ch1.xhtml", "<html/>")
+    with zipfile.ZipFile(path) as zf:
+        assert pc.find_opf_path(zf) == "OEBPS/content.opf"
+    with zipfile.ZipFile(tmp_path / "empty.epub", "w") as zf:
+        zf.writestr("mimetype", "application/epub+zip")
+    with zipfile.ZipFile(tmp_path / "empty.epub") as zf:
+        assert pc.find_opf_path(zf) is None
+
+
+def test_inventory_records_unreadable_transcript(tmp_path):
+    (tmp_path / "000.aac").write_bytes(b"\x00")
+    (tmp_path / "000.json").write_text("{not json", encoding="utf-8")
+    inventory = pc.get_audio_inventory({"folder_name": str(tmp_path), "audio_extension": ".aac"})
+    assert inventory[0]["transcript_status"] == "unreadable_transcript"
+    result = pc.check_missing_transcripts(inventory)
+    assert result["ok"] is False and result["findings"][0]["issue"] == "unreadable_transcript"

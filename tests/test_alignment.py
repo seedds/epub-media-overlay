@@ -761,7 +761,7 @@ def _run_unmatched_check(opf, mid_body):
             "out_file": path,
             "folder_name": os.path.dirname(path),
         }
-        return pc.test_unmatched_spine_html(book_info)
+        return pc.check_unmatched_spine_html(book_info)
     finally:
         os.unlink(path)
 
@@ -990,7 +990,7 @@ def test_audio_coverage_gaps_detects_interior_hole():
             ]
         }
     )
-    result = pc.test_audio_coverage_gaps(bi)
+    result = pc.check_audio_coverage_gaps(pc.parse_smil_audio_refs(bi))
     assert result["ok"] is False
     assert result["skipped"] is False
     assert len(result["findings"]) == 1
@@ -1014,7 +1014,7 @@ def test_audio_coverage_gaps_passes_when_contiguous():
             ]
         }
     )
-    result = pc.test_audio_coverage_gaps(bi)
+    result = pc.check_audio_coverage_gaps(pc.parse_smil_audio_refs(bi))
     assert result["ok"] is True
     assert result["findings"] == []
 
@@ -1024,13 +1024,13 @@ def test_audio_coverage_gaps_ignores_subsecond_gaps():
     bi = _book_info_with_smils(
         {"ch.smil": [("p1", "000.m4a", 0.0, 5.0), ("p2", "000.m4a", 5.4, 10.0)]}
     )
-    result = pc.test_audio_coverage_gaps(bi)  # 0.4s gap < 1.0s default
+    result = pc.check_audio_coverage_gaps(pc.parse_smil_audio_refs(bi))  # 0.4s gap < 1.0s default
     assert result["ok"] is True
 
 
 def test_audio_coverage_gaps_skips_without_smils():
     bi = {"folder_name": tempfile.mkdtemp(), "audio_extension": ".m4a"}
-    result = pc.test_audio_coverage_gaps(bi)
+    result = pc.check_audio_coverage_gaps(pc.parse_smil_audio_refs(bi))
     assert result["skipped"] is True
     assert result["ok"] is True
 

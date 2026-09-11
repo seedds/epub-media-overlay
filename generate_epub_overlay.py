@@ -683,7 +683,7 @@ def inspect_working_epub(working_epub_path: Path) -> str | None:
         return None
     try:
         with zipfile.ZipFile(working_epub_path, "r") as zf:
-            return next((name for name in zf.namelist() if name.endswith(".opf")), None)
+            return pipeline_core.find_opf_path(zf)
     except (OSError, zipfile.BadZipFile):
         return None
 

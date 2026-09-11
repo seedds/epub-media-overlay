@@ -73,7 +73,7 @@ Pipeline overview
    the finished package to a final `.epub` path.
 
 9. Run read-only post checks.
-   The `test_*` helpers and `run_post_checks()` audit the loose artifacts and the
+   The `check_*` helpers and `run_post_checks()` audit the loose artifacts and the
    packaged EPUB to catch missing transcripts, missing SMIL coverage, duplicate clip
    reuse, and broken OPF wiring.
 
@@ -217,7 +217,7 @@ def preprocess(book_info, source_epub_path):
     shutil.copy(str(source_epub_path), out_path)
 
     with zipfile.ZipFile(out_path, "r") as f:
-        opf_file = next((name for name in f.namelist() if name.endswith(".opf")), None)
+        opf_file = find_opf_path(f)
     if not opf_file:
         raise ValueError(f"No OPF package document found in {source_epub_path}")
 
@@ -347,6 +347,24 @@ def convert_soup_to_html(soup):
     return str(soup)
 
 
+def find_opf_path(zip_file):
+    """Locate the OPF package document inside an open EPUB zip, or return None.
+
+    Prefers the `rootfile` declared in META-INF/container.xml (the only authoritative
+    pointer) and falls back to the first `*.opf` entry for packages with a missing or
+    broken container.
+    """
+    try:
+        container = BeautifulSoup(zip_file.read("META-INF/container.xml"), "xml")
+        rootfile = container.find("rootfile")
+        full_path = rootfile.get("full-path") if rootfile else None
+        if full_path and full_path in zip_file.namelist():
+            return full_path
+    except (KeyError, OSError, zipfile.BadZipFile):
+        pass
+    return next((name for name in zip_file.namelist() if name.endswith(".opf")), None)
+
+
 def get_relative_zip_href(source_path, target_path):
     source_dir = posixpath.dirname(source_path) or "."
     return posixpath.relpath(target_path, start=source_dir)
@@ -368,12 +386,11 @@ def get_smil_duration(smil_file):
 
     total_duration = 0.0
     for audio_el in soup.find_all("audio"):
-        clip_begin = audio_el.get("clipBegin", "0s").rstrip("s")
-        clip_end = audio_el.get("clipEnd", "0s").rstrip("s")
-        try:
-            total_duration += max(0.0, float(clip_end) - float(clip_begin))
-        except ValueError:
+        clip_begin = parse_smil_clock_value(audio_el.get("clipBegin"))
+        clip_end = parse_smil_clock_value(audio_el.get("clipEnd"))
+        if clip_begin is None or clip_end is None:
             continue
+        total_duration += max(0.0, clip_end - clip_begin)
 
     return total_duration
 
@@ -445,10 +462,7 @@ def get_spine_ordered_html_files(zip_file):
     if not html_files:
         return []
 
-    opf_file = next(
-        (file_name for file_name in zip_file.namelist() if file_name.endswith(".opf")),
-        None,
-    )
+    opf_file = find_opf_path(zip_file)
     if not opf_file:
         return sorted(html_files)
 
@@ -1952,23 +1966,27 @@ def parse_smil_clock_value(value):
 
 
 def get_audio_inventory(book_info):
-    # This inventory is the shared base for several post checks. It joins three pieces
-    # of information about every split audio file: file name, transcript word count,
-    # and measured duration.
-    inventory = []
+    """One record per audio chunk on disk: duration, transcript status and word count.
 
+    Computed once per validation run and shared by every check. Probe failures record
+    a 0.0 duration (a "no coverage" sentinel the checks already handle) and transcript
+    problems are recorded as a status rather than raised, because validation reports
+    problems instead of aborting on them.
+    """
+    inventory = []
     for audio_file in iter_audio_files(book_info):
         json_file = os.path.splitext(audio_file)[0] + ".json"
         json_path = resolve_book_path(book_info, json_file)
         word_count = 0
-        if os.path.exists(json_path):
-            word_count = len(load_audio_tokens(json_path))
+        if not os.path.exists(json_path):
+            transcript_status = "missing_transcript"
+        else:
+            try:
+                word_count = len(load_audio_tokens(json_path))
+                transcript_status = "ok" if word_count >= 1 else "empty_transcript"
+            except Exception:
+                transcript_status = "unreadable_transcript"
 
-        # This inventory feeds the read-only post-check/validation stage, whose job is
-        # to *report* problems rather than abort. get_audio_duration raises when it
-        # cannot probe a file; downstream coverage checks compare duration
-        # numerically, so record 0.0 (a "no coverage" sentinel they already handle)
-        # instead of letting an unprobeable file crash validation.
         try:
             duration = get_audio_duration(resolve_book_path(book_info, audio_file))
         except RuntimeError:
@@ -1980,16 +1998,16 @@ def get_audio_inventory(book_info):
                 "json_file": json_file,
                 "duration": duration,
                 "word_count": word_count,
+                "transcript_status": transcript_status,
             }
         )
-
     return inventory
 
 
-def get_substantial_audio_files(book_info, min_duration=180.0, min_words=300):
+def substantial_audio_files(inventory, min_duration=180.0, min_words=300):
     return [
         item
-        for item in get_audio_inventory(book_info)
+        for item in inventory
         if item["duration"] >= min_duration or item["word_count"] >= min_words
     ]
 
@@ -2002,8 +2020,9 @@ def parse_smil_audio_refs(book_info):
     clip_totals = defaultdict(float)
     clip_counts = defaultdict(int)
     smil_audio_counts = {}
+    smil_files = iter_smil_files(book_info)
 
-    for smil_file in iter_smil_files(book_info):
+    for smil_file in smil_files:
         smil_path = resolve_book_path(book_info, smil_file)
         with open(smil_path, "r", encoding="utf-8") as f:
             soup = BeautifulSoup(f.read(), "xml")
@@ -2044,6 +2063,7 @@ def parse_smil_audio_refs(book_info):
         smil_audio_counts[smil_file] = valid_audio_count
 
     return {
+        "smil_files": smil_files,
         "refs": refs,
         "clip_totals": dict(clip_totals),
         "clip_counts": dict(clip_counts),
@@ -2107,10 +2127,7 @@ def inspect_epub_package(epub_path):
 
     try:
         with zipfile.ZipFile(epub_path, "r") as zf:
-            opf_file = next(
-                (file_name for file_name in zf.namelist() if file_name.endswith(".opf")),
-                None,
-            )
+            opf_file = find_opf_path(zf)
             if not opf_file:
                 return None
 
@@ -2200,12 +2217,11 @@ def get_manifest_href_map(opf_soup, opf_dir):
     return {"by_id": by_id, "by_path": by_path}
 
 
-def test_missing_long_audio(book_info, min_duration=180.0, min_words=300):
+def check_missing_long_audio(inventory, smil_data, min_duration=180.0, min_words=300):
     # This check is aimed at "big obvious misses": long or word-heavy audio files that
     # never appear in any SMIL. The first and last split audio files are exempt because
     # audiobook intros/outros often have no sensible overlay target.
-    smil_files = iter_smil_files(book_info)
-    if not smil_files:
+    if not smil_data["smil_files"]:
         return build_check_result(
             "missing_long_audio",
             True,
@@ -2214,8 +2230,8 @@ def test_missing_long_audio(book_info, min_duration=180.0, min_words=300):
             skipped=True,
         )
 
-    substantial_audio = get_substantial_audio_files(book_info, min_duration, min_words)
-    audio_files = iter_audio_files(book_info)
+    substantial_audio = substantial_audio_files(inventory, min_duration, min_words)
+    audio_files = [item["audio_file"] for item in inventory]
     if not substantial_audio:
         return build_check_result(
             "missing_long_audio",
@@ -2225,14 +2241,10 @@ def test_missing_long_audio(book_info, min_duration=180.0, min_words=300):
             skipped=True,
         )
 
-    smil_data = parse_smil_audio_refs(book_info)
     referenced_audio = {
         ref["audio_file"] for ref in smil_data["refs"] if ref["valid"] and ref["audio_file"]
     }
-    allowed_missing = set()
-    if audio_files:
-        allowed_missing.add(audio_files[0])
-        allowed_missing.add(audio_files[-1])
+    allowed_missing = {audio_files[0], audio_files[-1]} if audio_files else set()
 
     missing_substantial = [
         item for item in substantial_audio if item["audio_file"] not in referenced_audio
@@ -2262,15 +2274,11 @@ def test_missing_long_audio(book_info, min_duration=180.0, min_words=300):
     )
 
 
-def test_missing_transcripts(book_info):
-    # The pass condition is intentionally simple: every audio chunk should have a
-    # readable sibling `.json` with at least one usable word. This catches missing,
-    # broken, or empty transcription artifacts before later stages fail more opaquely.
-    # Use the configured audio extension (via iter_audio_files) rather than a
-    # hardcoded `*.m4a`, otherwise this check silently self-skips for any other
-    # extension and run_post_checks counts the skip as a pass.
-    audio_files = iter_audio_files(book_info)
-    if not audio_files:
+def check_missing_transcripts(inventory):
+    # Every audio chunk should have a readable sibling `.json` with at least one usable
+    # word. This catches missing, broken, or empty transcription artifacts before later
+    # stages fail more opaquely.
+    if not inventory:
         return build_check_result(
             "missing_transcripts",
             True,
@@ -2279,41 +2287,15 @@ def test_missing_transcripts(book_info):
             skipped=True,
         )
 
-    findings = []
-    for audio_file in audio_files:
-        json_file = os.path.splitext(audio_file)[0] + ".json"
-        json_path = resolve_book_path(book_info, json_file)
-        if not os.path.exists(json_path):
-            findings.append(
-                {
-                    "audio_file": audio_file,
-                    "json_file": json_file,
-                    "issue": "missing_transcript",
-                }
-            )
-            continue
-
-        try:
-            word_count = len(load_audio_tokens(json_path))
-        except Exception:
-            findings.append(
-                {
-                    "audio_file": audio_file,
-                    "json_file": json_file,
-                    "issue": "unreadable_transcript",
-                }
-            )
-            continue
-
-        if word_count < 1:
-            findings.append(
-                {
-                    "audio_file": audio_file,
-                    "json_file": json_file,
-                    "issue": "empty_transcript",
-                }
-            )
-
+    findings = [
+        {
+            "audio_file": item["audio_file"],
+            "json_file": item["json_file"],
+            "issue": item["transcript_status"],
+        }
+        for item in inventory
+        if item["transcript_status"] != "ok"
+    ]
     return build_check_result(
         "missing_transcripts",
         ok=not findings,
@@ -2323,12 +2305,13 @@ def test_missing_transcripts(book_info):
             else f"{len(findings)} audio chunk(s) are missing a usable transcript."
         ),
         findings=findings,
-        metrics={"audio_files": len(audio_files)},
+        metrics={"audio_files": len(inventory)},
     )
 
 
-def test_low_audio_coverage(
-    book_info,
+def check_low_audio_coverage(
+    inventory,
+    smil_data,
     min_duration=180.0,
     min_words=300,
     coverage_warn_ratio=0.60,
@@ -2336,8 +2319,7 @@ def test_low_audio_coverage(
     # A file can appear in SMILs and still be suspiciously under-covered. This check
     # compares summed clip durations to the real audio duration to flag transcripts or
     # alignments that only captured a small fraction of a substantial audio file.
-    smil_files = iter_smil_files(book_info)
-    if not smil_files:
+    if not smil_data["smil_files"]:
         return build_check_result(
             "low_audio_coverage",
             True,
@@ -2346,7 +2328,7 @@ def test_low_audio_coverage(
             skipped=True,
         )
 
-    substantial_audio = get_substantial_audio_files(book_info, min_duration, min_words)
+    substantial_audio = substantial_audio_files(inventory, min_duration, min_words)
     if not substantial_audio:
         return build_check_result(
             "low_audio_coverage",
@@ -2356,7 +2338,6 @@ def test_low_audio_coverage(
             skipped=True,
         )
 
-    smil_data = parse_smil_audio_refs(book_info)
     findings = []
     for item in substantial_audio:
         duration = item["duration"]
@@ -2402,7 +2383,7 @@ def _merge_intervals(intervals):
     return merged
 
 
-def test_audio_coverage_gaps(book_info, min_gap_seconds=1.0):
+def check_audio_coverage_gaps(smil_data, min_gap_seconds=1.0):
     # A chapter that straddles an audio-chunk seam is matched from two chunks. A bad
     # merge can leave a mid-file span referenced by no clip, so that narration is
     # skipped on playback AND missing from the OPF media:duration total (the number
@@ -2410,8 +2391,7 @@ def test_audio_coverage_gaps(book_info, min_gap_seconds=1.0):
     # to duration, so an 82%-covered file with a large interior hole passes it. This
     # check inspects contiguity: for every audio file referenced by SMILs it merges the
     # clip ranges and flags any interior gap between covered spans.
-    smil_files = iter_smil_files(book_info)
-    if not smil_files:
+    if not smil_data["smil_files"]:
         return build_check_result(
             "audio_coverage_gaps",
             True,
@@ -2420,7 +2400,6 @@ def test_audio_coverage_gaps(book_info, min_gap_seconds=1.0):
             skipped=True,
         )
 
-    smil_data = parse_smil_audio_refs(book_info)
     intervals_by_audio = defaultdict(list)
     for ref in smil_data["refs"]:
         if ref["valid"] and ref["audio_file"]:
@@ -2473,12 +2452,11 @@ def test_audio_coverage_gaps(book_info, min_gap_seconds=1.0):
     )
 
 
-def test_duplicate_audio_clips(book_info):
+def check_duplicate_audio_clips(smil_data):
     # Exact duplicate reuse means the same source file and the same clip range appear
     # multiple times in SMILs. That is often a sign of alignment duplication rather
     # than legitimate reuse.
-    smil_files = iter_smil_files(book_info)
-    if not smil_files:
+    if not smil_data["smil_files"]:
         return build_check_result(
             "duplicate_audio_clips",
             True,
@@ -2487,7 +2465,6 @@ def test_duplicate_audio_clips(book_info):
             skipped=True,
         )
 
-    smil_data = parse_smil_audio_refs(book_info)
     grouped_refs = defaultdict(list)
     for ref in smil_data["refs"]:
         if not ref["valid"]:
@@ -2533,18 +2510,17 @@ def test_duplicate_audio_clips(book_info):
         ),
         findings=findings,
         metrics={
-            "smil_files": len(smil_files),
+            "smil_files": len(smil_data["smil_files"]),
             "valid_audio_refs": sum(1 for ref in smil_data["refs"] if ref["valid"]),
         },
     )
 
 
-def test_overlapping_audio_clips(book_info, min_overlap_seconds=0.5):
+def check_overlapping_audio_clips(smil_data, min_overlap_seconds=0.5):
     # Overlap is weaker evidence than an exact duplicate, but substantial overlap on
     # the same source audio often still indicates that two overlay segments are trying
     # to claim the same narrated region.
-    smil_files = iter_smil_files(book_info)
-    if not smil_files:
+    if not smil_data["smil_files"]:
         return build_check_result(
             "overlapping_audio_clips",
             True,
@@ -2553,7 +2529,6 @@ def test_overlapping_audio_clips(book_info, min_overlap_seconds=0.5):
             skipped=True,
         )
 
-    smil_data = parse_smil_audio_refs(book_info)
     refs_by_audio = defaultdict(list)
     for ref in smil_data["refs"]:
         if ref["valid"]:
@@ -2616,19 +2591,18 @@ def test_overlapping_audio_clips(book_info, min_overlap_seconds=0.5):
         ),
         findings=findings,
         metrics={
-            "smil_files": len(smil_files),
+            "smil_files": len(smil_data["smil_files"]),
             "audio_files_checked": len(refs_by_audio),
             "min_overlap_seconds": min_overlap_seconds,
         },
     )
 
 
-def test_invalid_smil_clips(book_info):
+def check_invalid_smil_clips(smil_data):
     # This is a structural sanity check on the generated SMIL XML itself. A clip with a
     # missing src or non-increasing begin/end times is invalid regardless of how it was
     # produced.
-    smil_files = iter_smil_files(book_info)
-    if not smil_files:
+    if not smil_data["smil_files"]:
         return build_check_result(
             "invalid_smil_clips",
             True,
@@ -2637,7 +2611,6 @@ def test_invalid_smil_clips(book_info):
             skipped=True,
         )
 
-    smil_data = parse_smil_audio_refs(book_info)
     findings = []
     for ref in smil_data["refs"]:
         issue = None
@@ -2672,17 +2645,16 @@ def test_invalid_smil_clips(book_info):
         ),
         findings=findings,
         metrics={
-            "smil_files": len(smil_files),
+            "smil_files": len(smil_data["smil_files"]),
             "audio_refs": len(smil_data["refs"]),
         },
     )
 
 
-def test_overlay_without_audio(book_info):
+def check_overlay_without_audio(smil_data):
     # An HTML overlay SMIL that contains no valid `<audio>` entries is usually a sign
     # that matching or alignment failed but packaging still created the overlay shell.
-    smil_files = iter_smil_files(book_info)
-    if not smil_files:
+    if not smil_data["smil_files"]:
         return build_check_result(
             "overlay_without_audio",
             True,
@@ -2691,10 +2663,9 @@ def test_overlay_without_audio(book_info):
             skipped=True,
         )
 
-    smil_data = parse_smil_audio_refs(book_info)
     findings = [
         {"smil_file": smil_file, "audio_count": smil_data["smil_audio_counts"][smil_file]}
-        for smil_file in smil_files
+        for smil_file in smil_data["smil_files"]
         if smil_data["smil_audio_counts"].get(smil_file, 0) == 0
     ]
 
@@ -2707,7 +2678,7 @@ def test_overlay_without_audio(book_info):
             else f"{len(findings)} SMIL file(s) contain no valid audio clips."
         ),
         findings=findings,
-        metrics={"smil_files": len(smil_files)},
+        metrics={"smil_files": len(smil_data["smil_files"])},
     )
 
 
@@ -2724,10 +2695,7 @@ def get_toc_like_html_files(zip_file):
     """
     toc_paths = set()
 
-    opf_file = next(
-        (name for name in zip_file.namelist() if name.endswith(".opf")),
-        None,
-    )
+    opf_file = find_opf_path(zip_file)
     if opf_file:
         opf_dir = posixpath.dirname(opf_file) or "."
         try:
@@ -2770,7 +2738,7 @@ def _html_declares_toc(soup):
     return False
 
 
-def test_unmatched_spine_html(book_info, min_token_count=80):
+def check_unmatched_spine_html(book_info, min_token_count=80):
     # This check looks for substantive reading-order HTML files that fall between the
     # first and last matched chapters but never received any match row. Those files are
     # the clearest signal that playback coverage silently skipped part of the book.
@@ -2894,7 +2862,7 @@ def test_unmatched_spine_html(book_info, min_token_count=80):
     )
 
 
-def test_missing_media_overlays(book_info):
+def check_missing_media_overlays(book_info):
     # This is the packaged-EPUB-side counterpart to the loose SMIL checks above. It
     # verifies that each matched HTML file is actually wired in the OPF to its overlay
     # SMIL, and that the referenced overlay file exists inside the package.
@@ -2999,25 +2967,27 @@ def run_post_checks(
 ):
     # The runner intentionally mixes pre-package and post-package checks. Individual
     # checks decide whether to pass, fail, or skip depending on which artifacts exist.
-    # This lets the same function be called at different points in the pipeline.
+    # The audio inventory (one ffprobe per chunk) and the SMIL parse are computed once
+    # here and shared.
+    inventory = get_audio_inventory(book_info)
+    smil_data = parse_smil_audio_refs(book_info)
     results = [
-        test_missing_transcripts(book_info),
-        test_missing_long_audio(book_info, min_duration=min_duration, min_words=min_words),
-        test_low_audio_coverage(
-            book_info,
+        check_missing_transcripts(inventory),
+        check_missing_long_audio(inventory, smil_data, min_duration=min_duration, min_words=min_words),
+        check_low_audio_coverage(
+            inventory,
+            smil_data,
             min_duration=min_duration,
             min_words=min_words,
             coverage_warn_ratio=coverage_warn_ratio,
         ),
-        test_audio_coverage_gaps(book_info),
-        test_duplicate_audio_clips(book_info),
-        test_overlapping_audio_clips(
-            book_info, min_overlap_seconds=min_overlap_seconds
-        ),
-        test_invalid_smil_clips(book_info),
-        test_overlay_without_audio(book_info),
-        test_unmatched_spine_html(book_info),
-        test_missing_media_overlays(book_info),
+        check_audio_coverage_gaps(smil_data),
+        check_duplicate_audio_clips(smil_data),
+        check_overlapping_audio_clips(smil_data, min_overlap_seconds=min_overlap_seconds),
+        check_invalid_smil_clips(smil_data),
+        check_overlay_without_audio(smil_data),
+        check_unmatched_spine_html(book_info),
+        check_missing_media_overlays(book_info),
     ]
     ok_results = sum(1 for result in results if result["ok"] and not result["skipped"])
     skipped_results = sum(1 for result in results if result["skipped"])
@@ -3098,6 +3068,52 @@ def anchor_audio_file_tails(aggregated_matches_by_html, book_info):
             continue
         if duration > clip["end"]:
             clip["end"] = duration
+
+
+def write_smil_file(smil_path, html_file, segments, aggregated_matches):
+    """Write one grouped SMIL for `html_file`: a <par> per timed segment, in text order.
+
+    `aggregated_matches` maps segment id -> resolved clip ({start, end, audio_file}).
+    A <par> is written only when end > start; segments without a clip are skipped so
+    the reader falls through to the next timed segment.
+    """
+    soup_smil = BeautifulSoup("<smil/>", "xml")
+    smil = soup_smil.smil
+    smil["xmlns"] = "http://www.w3.org/ns/SMIL"
+    smil["xmlns:epub"] = "http://www.idpf.org/2007/ops"
+    smil["version"] = "3.0"
+
+    body = soup_smil.new_tag("body")
+    smil.append(body)
+    seq = soup_smil.new_tag(
+        "seq",
+        attrs={
+            "id": make_overlay_id(html_file),
+            "epub:textref": "../" + html_file,
+            "epub:type": "chapter",
+        },
+    )
+    body.append(seq)
+
+    for seg in segments:
+        seg_id = seg.get("id")
+        info = aggregated_matches.get(seg_id)
+        if info is None or not info["end"] > info["start"]:
+            continue
+        par = soup_smil.new_tag("par", id=seg_id)
+        par.append(soup_smil.new_tag("text", src=f"../{html_file}#{seg_id}"))
+        par.append(
+            soup_smil.new_tag(
+                "audio",
+                src=f"../audio/{info['audio_file']}",
+                clipBegin=f"{info['start']:.3f}s",
+                clipEnd=f"{info['end']:.3f}s",
+            )
+        )
+        seq.append(par)
+
+    with open(smil_path, "w", encoding="utf-8") as f:
+        f.write(convert_soup_to_html(soup_smil))
 
 
 def create_smil_files(book_info):
@@ -3242,63 +3258,7 @@ def create_smil_files(book_info):
         smil_path = resolve_book_path(book_info, make_overlay_basename(html_file))
 
         segments, _html_tokens = load_html_segments_and_tokens(working_epub, html_file)
-        aggregated_matches = aggregated_matches_by_html.get(html_file, {})
-
-        # Build the grouped SMIL shell for this one HTML file.
-        soup_smil = BeautifulSoup("<smil/>", "xml")
-        smil = soup_smil.smil
-        smil["xmlns"] = "http://www.w3.org/ns/SMIL"
-        smil["xmlns:epub"] = "http://www.idpf.org/2007/ops"
-        smil["version"] = "3.0"
-
-        body = soup_smil.new_tag("body")
-        smil.append(body)
-
-        seq = soup_smil.new_tag(
-            "seq",
-            attrs={
-                "id": make_overlay_id(html_file),
-                "epub:textref": "../" + html_file,
-                "epub:type": "chapter",
-            },
-        )
-        body.append(seq)
-
-        final_timestamps = {
-            item["id"]: item
-            for item in sorted(
-                aggregated_matches.values(), key=lambda match: match["segment_index"]
-            )
-        }
-
-        for seg in segments:
-            seg_id = seg.get("id")
-
-            if seg_id in final_timestamps:
-                info = final_timestamps[seg_id]
-                start_t = info["start"]
-                end_t = info["end"]
-
-                if end_t > start_t:
-                    par = soup_smil.new_tag("par", id=seg_id)
-
-                    text_src = f"../{html_file}#{seg_id}"
-                    text_el = soup_smil.new_tag("text", src=text_src)
-                    par.append(text_el)
-
-                    audio_el = soup_smil.new_tag(
-                        "audio",
-                        src=f"../audio/{info['audio_file']}",
-                        clipBegin=f"{start_t:.3f}s",
-                        clipEnd=f"{end_t:.3f}s",
-                    )
-                    par.append(audio_el)
-
-                    seq.append(par)
-
-        # Write SMIL
-        with open(smil_path, "w", encoding="utf-8") as f:
-            f.write(convert_soup_to_html(soup_smil))
+        write_smil_file(smil_path, html_file, segments, aggregated_matches_by_html.get(html_file, {}))
 
     print_nonzero_summary(
         "SMIL summary",
@@ -3358,15 +3318,12 @@ def post_processing_opf(book_info, output_epub_path):
     working_epub = resolve_book_path(book_info, book_info["out_file"])
 
     with zipfile.ZipFile(working_epub, "r") as f:
-        for file_name in f.namelist():
-            if ".opf" in file_name:
-                break
-        assert ".opf" in file_name
+        opf_file = find_opf_path(f)
+        if not opf_file:
+            raise ValueError(f"No OPF package document found in {working_epub}")
+        with f.open(opf_file) as handle:
+            soup = BeautifulSoup(handle.read(), "lxml-xml")
 
-        with f.open(file_name) as opf_file:
-            soup = BeautifulSoup(opf_file.read(), "lxml-xml")
-
-        opf_file = file_name
         opf_dir = posixpath.dirname(opf_file) or "."
         package = soup.find("package")
         package["version"] = "3.0"
