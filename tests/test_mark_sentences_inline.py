@@ -105,7 +105,6 @@ def test_mark_segments_skips_cleanup_when_index_build_fails(tmp_path, monkeypatc
         raise RuntimeError("indexer exploded")
 
     monkeypatch.setattr(pc, "build_reference_index", _boom)
-    monkeypatch.chdir(tmp_path)  # mark_segments still writes loose copies to cwd
     book_info = {
         "folder_name": str(tmp_path),
         "out_file": str(epub),
@@ -122,3 +121,41 @@ def test_mark_segments_skips_cleanup_when_index_build_fails(tmp_path, monkeypatc
     p = BeautifulSoup(html, "lxml").p
     assert p["class"] == ["chapter"] and p["id"] == "c1"
     assert "-segment" in html  # segmentation itself still happened
+
+
+# --- cleanup must not alter visible text ---------------------------------------
+
+
+def test_whitespace_only_inline_tag_keeps_the_space():
+    html = "<html><body><p>foo<i> </i>bar and more words follow here.</p></body></html>"
+    out = ms.mark_sentences(html, "x", referenced_classes=frozenset(), referenced_ids=frozenset())
+    assert "foo bar" in BeautifulSoup(out, "lxml").get_text()
+
+
+def test_empty_block_is_not_removed_by_cleanup():
+    # An attribute-free empty <p> is a visible spacer; only inline leftovers go.
+    out = ms.preprocess_remove_redundant_tags("<html><body><p>a</p><p></p><p>b</p></body></html>")
+    assert len(BeautifulSoup(out, "lxml").find_all("p")) == 3
+
+
+def test_text_altering_cleanup_is_detected(monkeypatch):
+    def _drop_a_char(soup, classes, ids):
+        node = soup.find(string=True)
+        node.replace_with(node[1:])
+
+    monkeypatch.setattr(ms, "_clean_soup", _drop_a_char)
+    with pytest.raises(ValueError, match="Text integrity"):
+        ms.mark_sentences(
+            "<html><body><p>Hello there.</p></body></html>",
+            "x",
+            referenced_classes=frozenset(),
+            referenced_ids=frozenset(),
+        )
+
+
+def test_css_link_added_once():
+    html = "<html><head><title>t</title></head><body><p>Hello there.</p></body></html>"
+    out = ms.mark_sentences(html, "x", css_href="../readaloud.css")
+    out = ms.mark_sentences(out, "y", css_href="../readaloud.css")
+    links = BeautifulSoup(out, "lxml").find_all("link", href="../readaloud.css")
+    assert len(links) == 1

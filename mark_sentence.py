@@ -88,7 +88,8 @@ Pipeline overview
      nodes, which can serialize differently and create false integrity failures
 
 5. Validate aggressively.
-    Compare original and segmented visible text. Treat mismatches as real failures.
+   Compare the visible text captured before any mutation (cleanup included) with
+   the final segmented DOM. Treat mismatches as real failures.
 
 Key invariants
 --------------
@@ -164,6 +165,7 @@ from nltk.tokenize.punkt import PunktParameters, PunktSentenceTokenizer
 from typing import List, Tuple, Union
 
 
+_LOGGER = logging.getLogger(__name__)
 _NLTK_RESOURCES_READY = False
 _PUNKT_LANGUAGE_MAP = {
     "cs": "czech",
@@ -457,25 +459,39 @@ def _unwrap_bare_wrapper_spans(soup: BeautifulSoup) -> None:
 
 
 def _remove_empty_attribute_free_tags(soup: BeautifulSoup) -> None:
-    """Remove tags that are empty and attribute-free, leaving structure intact.
+    """Remove inline tags that are empty and attribute-free; unwrap whitespace-only ones.
 
-    Void tags (which are meaningful even when empty), `<a>` (empty anchors are
-    load-bearing navigation targets), and structurally positional tags such as
-    `<td>`/`<li>` (see STRUCTURAL_EMPTY_SIGNIFICANT_TAGS) are never removed.
-    Emptiness means no child tags and no non-whitespace text.
+    Only inline formatting tags are candidates: an attribute-free empty block such as
+    `<p></p>` is a visible spacer, an empty `<td>`/`<li>` is positional, an empty
+    `<a>` is a navigation target, and void tags are meaningful when empty. A tag
+    whose only content is whitespace is unwrapped rather than removed so the space
+    between the neighbouring words survives (`foo<i> </i>bar` must not become
+    `foobar`).
     """
     for tag in list(soup.find_all(True)):
-        if tag.name in VOID_TAGS or tag.name == "a":
-            continue
-        if tag.name in STRUCTURAL_EMPTY_SIGNIFICANT_TAGS:
+        if tag.name not in INLINE_TAGS or tag.name == "a":
             continue
         if tag.attrs:
             continue
         if tag.find(True) is not None:
             continue
-        if tag.get_text(strip=True):
+        text = tag.get_text()
+        if text.strip():
             continue
-        tag.decompose()
+        if text:
+            tag.unwrap()
+        else:
+            tag.decompose()
+
+
+def _clean_soup(
+    soup: BeautifulSoup, referenced_classes: frozenset, referenced_ids: frozenset
+) -> None:
+    """Apply the three redundant-markup passes to `soup` in place (see
+    `preprocess_remove_redundant_tags` for the contract)."""
+    _strip_unused_attributes(soup, referenced_classes, referenced_ids)
+    _unwrap_bare_wrapper_spans(soup)
+    _remove_empty_attribute_free_tags(soup)
 
 
 def preprocess_remove_redundant_tags(
@@ -500,28 +516,26 @@ def preprocess_remove_redundant_tags(
     1. Strip unreferenced `class` values and `id`s from every element.
     2. Unwrap `<span>`s that are now attribute-free (e.g. a former Kobo span, or a
        span whose only class was unused), preserving their text.
-    3. Remove tags that are now empty and attribute-free (e.g. a leftover span whose
-       only content and attributes were removed), never touching void tags or `<a>`.
+    3. Remove inline tags that are now empty and attribute-free (e.g. a leftover
+       span whose only content and attributes were removed); whitespace-only ones
+       are unwrapped so visible spacing is preserved.
+
+    Returns the FULL document (`str(soup)`); the `<head>` must survive because the
+    caller injects the read-aloud stylesheet link into it.
     """
     soup = BeautifulSoup(html_content, "lxml")
-
-    _strip_unused_attributes(soup, referenced_classes, referenced_ids)
-    _unwrap_bare_wrapper_spans(soup)
-    _remove_empty_attribute_free_tags(soup)
-
-    # CRITICAL: return the FULL document (str(soup)).
-    # Do NOT return soup.body.encode_contents(), or you lose the <head> tag,
-    # causing 'AttributeError: NoneType has no attribute append' in the sync script.
+    _clean_soup(soup, referenced_classes, referenced_ids)
     return str(soup)
 
 
 def mark_sentences(
-    html_content: str,
+    html_content: Union[str, bytes],
     chapter_id: str = "chapter",
     language: str = "english",
     min_words: int = 1,
     referenced_classes: frozenset | None = None,
     referenced_ids: frozenset | None = None,
+    css_href: str | None = None,
 ) -> str:
     """Segment content by wrapping text in segment spans. Preserves structure and void tags.
 
@@ -530,23 +544,25 @@ def mark_sentences(
     redundant-markup cleanup is skipped entirely (nothing is stripped). Passing
     explicit sets, including empty ones, enables the cleanup with those sets taken
     as complete.
+
+    `css_href`, when given, is appended to `<head>` as a stylesheet link (the
+    read-aloud highlight CSS) unless an identical link already exists.
+
+    The document is parsed exactly once. The visible text is captured before any
+    mutation and compared against the final DOM, so a cleanup pass that altered
+    text would be caught, not just a segmentation error.
     """
+    soup = BeautifulSoup(html_content, "lxml")
+    original_text = soup.get_text()
 
     # Stage 1: remove markup/attributes that nothing in the EPUB references. Only
     # when the reference index is known; an unknown index must never strip anything.
-    if referenced_classes is None or referenced_ids is None:
-        cleaned_html = html_content
-    else:
-        cleaned_html = preprocess_remove_redundant_tags(
-            html_content, referenced_classes, referenced_ids
-        )
-
-    # Stage 2: parse the full cleaned document.
-    soup = BeautifulSoup(cleaned_html, "lxml")
+    if referenced_classes is not None and referenced_ids is not None:
+        _clean_soup(soup, referenced_classes, referenced_ids)
 
     global_counter = 1
 
-    # Stage 3: process only block elements that are effectively leaves in block space.
+    # Stage 2: process only block elements that are effectively leaves in block space.
     block_tags = [
         "p",
         "h1",
@@ -569,13 +585,20 @@ def mark_sentences(
                 elem, chapter_id, global_counter, language, min_words
             )
 
-    final_html = str(soup)
+    # Stage 3: attach the read-aloud stylesheet. A <link> contributes no text, so it
+    # is added before validation without affecting the comparison.
+    if css_href and soup.head is not None:
+        head = soup.head
+        if not head.find("link", attrs={"href": css_href, "rel": "stylesheet"}):
+            head.append(
+                soup.new_tag("link", rel="stylesheet", href=css_href, type="text/css")
+            )
 
-    # Stage 4: validate against the live segmented DOM, not against reparsed output.
-    if not validate_text_consistency(cleaned_html, soup, chapter_id):
+    # Stage 4: validate the live DOM against the text captured before any mutation.
+    if not validate_text_consistency(original_text, soup.get_text(), chapter_id):
         raise ValueError(f"Text integrity check failed for {chapter_id}")
 
-    return final_html
+    return str(soup)
 
 
 def _has_block_children(element: Tag) -> bool:
@@ -1150,64 +1173,38 @@ def _get_sentence_aware_segment_boundaries(
 
 
 def validate_text_consistency(
-    original_html: Union[str, bytes, BeautifulSoup, Tag],
-    segmented_html: Union[str, bytes, BeautifulSoup, Tag],
-    chapter_id: str = "chapter",
+    original_text: str, segmented_text: str, chapter_id: str = "chapter"
 ) -> bool:
-    """Safely validate text integrity. NO STRIP to preserve spaces."""
+    """Compare visible text before and after segmentation.
 
-    # Strict visible-text integrity check with localized diff output on failure.
+    Repeated spaces within a line are collapsed and line edges trimmed (serializer
+    whitespace drift is not a content change), but nothing else is normalized: a
+    lost or added character, or two words merged, is a failure. On failure the first
+    divergence is logged with `repr()` so hidden whitespace is visible.
+    """
 
-    def to_soup(content):
-        if isinstance(content, (BeautifulSoup, Tag)):
-            return content
-        if isinstance(content, bytes):
-            try:
-                content = content.decode("utf-8")
-            except:
-                content = content.decode("latin-1", errors="replace")
-        return BeautifulSoup(content, "lxml")
+    def normalize(text: str) -> str:
+        return "\n".join(re.sub(r" +", " ", line).strip() for line in text.split("\n"))
 
-    original_soup = to_soup(original_html)
-    segmented_soup = to_soup(segmented_html)
-
-    orig_text = original_soup.get_text()
-    new_text = segmented_soup.get_text()
-
-    # First compare with light whitespace normalization.
-    def normalize_for_validation(text):
-        # Collapse repeated spaces within each line but preserve line boundaries.
-        lines = [re.sub(r" +", " ", line).strip() for line in text.split("\n")]
-        return "\n".join(lines)
-
-    orig_normalized = normalize_for_validation(orig_text)
-    new_normalized = normalize_for_validation(new_text)
-
-    if orig_normalized == new_normalized:
+    if normalize(original_text) == normalize(segmented_text):
         return True
 
-    # Locate the first raw divergence for debugging output.
-    min_len = min(len(orig_text), len(new_text))
-    diff_idx = min_len
-    for i in range(min_len):
-        if orig_text[i] != new_text[i]:
-            diff_idx = i
-            break
-
-    # Print a local text window around the mismatch. `repr()` keeps hidden whitespace
-    # visible in the log.
+    min_len = min(len(original_text), len(segmented_text))
+    diff_idx = next(
+        (i for i in range(min_len) if original_text[i] != segmented_text[i]), min_len
+    )
     context_start = max(0, diff_idx - 40)
     context_end = diff_idx + 60
-
-    print(f"\n{'=' * 30}")
-    print(f"INTEGRITY FAIL: {chapter_id}")
-    print(f"Divergence detected at index: {diff_idx}")
-
-    # We use repr() to reveal hidden characters like \n, \t, or \r
-    print(f"Original  Diff: ...{repr(orig_text[context_start:context_end])}...")
-    print(f"Segmented Diff: ...{repr(new_text[context_start:context_end])}...")
-
-    if len(orig_text) != len(new_text):
-        print(f"Length mismatch: Original={len(orig_text)}, Segmented={len(new_text)}")
-
+    _LOGGER.error(
+        "Text integrity check failed for %s at index %d\n  original:  %r\n  segmented: %r%s",
+        chapter_id,
+        diff_idx,
+        original_text[context_start:context_end],
+        segmented_text[context_start:context_end],
+        (
+            f"\n  length mismatch: original={len(original_text)}, segmented={len(segmented_text)}"
+            if len(original_text) != len(segmented_text)
+            else ""
+        ),
+    )
     return False

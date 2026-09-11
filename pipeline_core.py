@@ -1475,30 +1475,14 @@ def mark_segments(book_info):
             with f.open(html_file_name) as html_file:
                 html_content = html_file.read()
 
-            processed_html = mark_sentences(
+            replacements[html_file_name] = mark_sentences(
                 html_content,
                 make_segment_prefix(html_file_name),
                 language=language,
                 referenced_classes=referenced_classes,
                 referenced_ids=referenced_ids,
+                css_href=get_relative_zip_href(html_file_name, css_zip_path),
             )
-            soup = BeautifulSoup(processed_html, "lxml")
-            head = soup.head
-            css_href = get_relative_zip_href(html_file_name, css_zip_path)
-            if head and not head.find(
-                "link", attrs={"href": css_href, "rel": "stylesheet"}
-            ):
-                link = soup.new_tag(
-                    "link",
-                    rel="stylesheet",
-                    href=css_href,
-                    type="text/css",
-                )
-                head.append(link)
-            replacements[html_file_name] = str(soup)
-
-            with open(os.path.basename(html_file_name), "w") as html_out:
-                html_out.write(convert_soup_to_html(soup))
 
     if replacements:
         replace_files_in_zip(book_info["out_file"], replacements)
