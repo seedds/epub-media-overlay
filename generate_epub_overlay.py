@@ -28,13 +28,13 @@ from typing import Any
 import pipeline_core
 from mark_sentence import ensure_nltk_resources
 from transcription_backend import (
+    BACKEND_MLX,
+    BACKENDS,
+    REQUIRED_MODULE_BY_BACKEND,
     apply_mlx_cache_limit,
-    available_backends,
     default_model_for_backend,
-    describe_backend_params,
     detect_transcription_backend,
-    is_mlx_backend,
-    required_module_for_backend,
+    release_models,
 )
 
 STAGES = (
@@ -302,7 +302,7 @@ def parse_args() -> PipelineConfig:
     )
     parser.add_argument(
         "--backend",
-        choices=available_backends(),
+        choices=BACKENDS,
         help="Transcription backend override. Defaults to the platform-appropriate backend.",
     )
     parser.add_argument(
@@ -472,7 +472,7 @@ def preflight(config: PipelineConfig, logger: logging.Logger) -> None:
     ensure_command("ffprobe")
     ensure_command("ffmpeg")
     # Core libraries are imported at module load; only the ASR backend is lazy.
-    module_name = required_module_for_backend(config.backend)
+    module_name = REQUIRED_MODULE_BY_BACKEND[config.backend]
     try:
         importlib.import_module(module_name)
     except ModuleNotFoundError as exc:
@@ -597,9 +597,8 @@ def log_run_header(
     logger.info("Transcription backend: %s", config.backend)
     logger.info("Transcription model: %s", config.model)
     logger.info("Transcription language: %s", config.language)
-    for name, value in describe_backend_params(config.backend, config.batch_size).items():
-        logger.info("Transcription %s: %s", name.replace("_", " "), value)
-    if is_mlx_backend(config.backend):
+    logger.info("Transcription batch size: %d", config.batch_size)
+    if config.backend == BACKEND_MLX:
         logger.info(
             "mlx Metal cache limit: %s",
             f"{config.mlx_cache_gb:.1f} GB" if config.mlx_cache_gb else "unbounded (default)",
@@ -1034,7 +1033,10 @@ def run_transcribe_stage(
     if applied_cache_gb is not None:
         logger.info("mlx Metal cache limit set to %.1f GB", applied_cache_gb)
 
-    pipeline_core.transcribe_audio(book_info)
+    try:
+        pipeline_core.transcribe_audio(book_info)
+    finally:
+        release_models()
 
     audio_files = state.get("artifacts", {}).get("audio_files")
     if not audio_files:

@@ -178,10 +178,6 @@ from transcription_backend import (
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 warnings.filterwarnings("ignore", category=UserWarning, module="zipfile")
 
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
-os.environ["MPLBACKEND"] = "Agg"
-
 # Stream-copy chunks should match the planned span very closely, so a tight
 # tolerance is appropriate. AAC re-encoding, however, introduces encoder priming
 # delay and frame-boundary padding that make the reported stream duration drift
