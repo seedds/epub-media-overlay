@@ -16,7 +16,6 @@ import logging
 import os
 import re
 import shutil
-import subprocess
 import sys
 import time
 import traceback
@@ -26,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import pipeline_core
 from mark_sentence import ensure_nltk_resources
 from transcription_backend import (
     apply_mlx_cache_limit,
@@ -60,7 +60,6 @@ class PipelineConfig:
     audio: Path
     epub: Path
     output_dir: Path
-    output_path: Path
     work_dir: Path
     backend: str
     model: str
@@ -419,7 +418,6 @@ def parse_args() -> PipelineConfig:
         if args.work_dir
         else output_dir / f".{epub.stem}.epubmo"
     )
-    output_path = output_dir / f"{epub.stem}.media-overlay.epub"
     backend = args.backend or detect_transcription_backend()
     model = args.model or default_model_for_backend(backend)
     audio_bitrate = resolve_audio_bitrate(args.audio_codec, args.audio_bitrate)
@@ -431,7 +429,6 @@ def parse_args() -> PipelineConfig:
         audio=audio,
         epub=epub,
         output_dir=output_dir,
-        output_path=output_path,
         work_dir=work_dir,
         backend=backend,
         model=model,
@@ -461,17 +458,8 @@ def build_paths(config: PipelineConfig) -> RuntimePaths:
         validation_path=config.work_dir / "validation.json",
         working_epub_path=run_dir / config.epub.with_suffix(".epub3").name,
         packaged_epub_path=config.work_dir / source_output_name,
-        output_path=config.output_path,
+        output_path=config.output_dir / f"{config.epub.stem}.media-overlay.epub",
     )
-
-
-def load_pipeline_module():
-    try:
-        return importlib.import_module("pipeline_core")
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            f"Missing Python dependency: {exc.name}. Install the pipeline requirements before running."
-        ) from exc
 
 
 def preflight(config: PipelineConfig, logger: logging.Logger) -> None:
@@ -483,13 +471,14 @@ def preflight(config: PipelineConfig, logger: logging.Logger) -> None:
         raise ValueError(f"Expected an .epub input, got: {config.epub}")
     ensure_command("ffprobe")
     ensure_command("ffmpeg")
-    for module_name in ("bs4", "lxml", "tqdm", required_module_for_backend(config.backend)):
-        try:
-            importlib.import_module(module_name)
-        except ModuleNotFoundError as exc:
-            raise RuntimeError(
-                f"Missing Python dependency: {module_name}. Install the pipeline requirements before running."
-            ) from exc
+    # Core libraries are imported at module load; only the ASR backend is lazy.
+    module_name = required_module_for_backend(config.backend)
+    try:
+        importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            f"Missing Python dependency: {module_name}. Install the pipeline requirements before running."
+        ) from exc
 
     ensure_nltk_resources(logger)
 
@@ -630,7 +619,7 @@ def log_run_header(
             config.audio_channels or "source default",
         )
     logger.info("Output dir: %s", config.output_dir)
-    logger.info("Output EPUB: %s", config.output_path)
+    logger.info("Output EPUB: %s", paths.output_path)
     logger.info("Work dir: %s", paths.root)
     logger.info("Run dir: %s", paths.run_dir)
     logger.info("Detailed log: %s", paths.logs_dir / "pipeline.log")
@@ -644,9 +633,28 @@ def log_run_summary(
     validation_ok: bool,
 ) -> None:
     logger.info("Run completed in %.1fs", time.monotonic() - started_at)
-    logger.info("Final EPUB: %s", config.output_path)
+    logger.info("Final EPUB: %s", paths.output_path)
     logger.info("Validation result: %s", "passed" if validation_ok else "failed")
     logger.info("Detailed log: %s", paths.logs_dir / "pipeline.log")
+
+
+def book_info_from_config(config: PipelineConfig, paths: RuntimePaths) -> dict[str, Any]:
+    """The engine's shared context for this run, before prepare fills in the OPF details."""
+    return {
+        "folder_name": str(paths.run_dir),
+        "audio_file": config.audio.name,
+        "audio_extension": config.audio_extension,
+        "audio_codec": config.audio_codec,
+        "audio_bitrate": config.audio_bitrate,
+        "audio_sample_rate": config.audio_sample_rate,
+        "audio_channels": config.audio_channels,
+        "split_jobs": config.split_jobs,
+        "chunk_seconds": config.chunk_seconds,
+        "batch_size": config.batch_size,
+        "backend": config.backend,
+        "model": config.model,
+        "language": config.language,
+    }
 
 
 def build_book_info(state: dict[str, Any], paths: RuntimePaths, matched_list: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -659,25 +667,14 @@ def build_book_info(state: dict[str, Any], paths: RuntimePaths, matched_list: li
     return book_info
 
 
-def refresh_working_epub(legacy: Any, book_info: dict[str, Any], run_dir: Path, source_epub: Path) -> dict[str, Any]:
-    refreshed = {
-        "folder_name": str(run_dir),
-        "audio_file": book_info["audio_file"],
-        "audio_extension": book_info["audio_extension"],
-        "audio_codec": book_info.get("audio_codec", "copy"),
-        "audio_bitrate": book_info.get("audio_bitrate"),
-        "audio_sample_rate": book_info.get("audio_sample_rate"),
-        "audio_channels": book_info.get("audio_channels"),
-        "split_jobs": book_info.get("split_jobs", 1),
-        "chunk_seconds": book_info.get("chunk_seconds", 600),
-        "batch_size": book_info.get("batch_size", DEFAULT_TRANSCRIBE_BATCH_SIZE),
-        "backend": book_info.get("backend"),
-        "model": book_info.get("model"),
-        "language": book_info.get("language", "en"),
-    }
-    audio_file, _source_epub, out_file = legacy.preprocess(refreshed, source_epub)
-    refreshed.update({"audio_file": audio_file, "epub_file": out_file, "out_file": out_file})
-    return refreshed
+def refresh_working_epub(config: PipelineConfig, paths: RuntimePaths) -> dict[str, Any]:
+    """Re-copy the source EPUB into the working `.epub3` and return fresh book_info."""
+    book_info = book_info_from_config(config, paths)
+    audio_file, _source_epub, out_file = pipeline_core.preprocess(
+        book_info, paths.run_dir / config.epub.name
+    )
+    book_info.update({"audio_file": audio_file, "epub_file": out_file, "out_file": out_file})
+    return book_info
 
 
 def inspect_working_epub(working_epub_path: Path) -> str | None:
@@ -702,26 +699,16 @@ def build_prepared_book_info_from_artifacts(
     if not copied_audio.exists() or not copied_epub.exists() or opf_file is None:
         return None
 
-    opf_dir = str(Path(opf_file).parent)
-    return {
-        "folder_name": str(paths.run_dir),
-        "audio_file": copied_audio.name,
-        "audio_extension": config.audio_extension,
-        "audio_codec": config.audio_codec,
-        "audio_bitrate": config.audio_bitrate,
-        "audio_sample_rate": config.audio_sample_rate,
-        "audio_channels": config.audio_channels,
-        "split_jobs": config.split_jobs,
-        "chunk_seconds": config.chunk_seconds,
-        "batch_size": config.batch_size,
-        "backend": config.backend,
-        "model": config.model,
-        "language": config.language,
-        "epub_file": working_epub.name,
-        "out_file": working_epub.name,
-        "opf_file": opf_file,
-        "opf_dir": opf_dir,
-    }
+    book_info = book_info_from_config(config, paths)
+    book_info.update(
+        {
+            "epub_file": working_epub.name,
+            "out_file": working_epub.name,
+            "opf_file": opf_file,
+            "opf_dir": str(Path(opf_file).parent),
+        }
+    )
+    return book_info
 
 
 def ensure_prepare_state_from_artifacts(
@@ -748,8 +735,8 @@ def ensure_prepare_state_from_artifacts(
     return dict(recovered)
 
 
-def expected_audio_files(legacy: Any, book_info: dict[str, Any], run_dir: Path) -> tuple[list[str], list[dict[str, Any]]]:
-    chunk_plan = legacy.plan_audio_chunks(book_info, run_dir / book_info["audio_file"])
+def expected_audio_files(book_info: dict[str, Any], run_dir: Path) -> tuple[list[str], list[dict[str, Any]]]:
+    chunk_plan = pipeline_core.plan_audio_chunks(book_info, run_dir / book_info["audio_file"])
     names = [chunk["output_name"] for chunk in chunk_plan]
     return names, chunk_plan
 
@@ -764,40 +751,17 @@ def expected_transcript_files(audio_files: list[str]) -> list[str]:
     return [Path(name).with_suffix(".json").name for name in audio_files]
 
 
-def matched_json_files(matched_list: list[dict[str, Any]], legacy: Any) -> list[str]:
-    seen = set()
-    json_files = []
-    for item in legacy.normalize_matched_list(matched_list):
-        json_file = item["json_file"]
-        if json_file in seen:
-            continue
-        seen.add(json_file)
-        json_files.append(json_file)
-    return json_files
+def unique_html_files(matched_list: list[dict[str, Any]]) -> list[str]:
+    """Matched HTML files in first-seen order (one overlay/SMIL per HTML file)."""
+    return list(
+        dict.fromkeys(
+            item["html_file"] for item in pipeline_core.normalize_matched_list(matched_list)
+        )
+    )
 
 
-def expected_smil_files(matched_list: list[dict[str, Any]], legacy: Any) -> list[str]:
-    html_files = []
-    seen = set()
-    for item in legacy.normalize_matched_list(matched_list):
-        html_file = item["html_file"]
-        if html_file in seen:
-            continue
-        seen.add(html_file)
-        html_files.append(html_file)
-    return [legacy.make_overlay_basename(html_file) for html_file in html_files]
-
-
-def matched_html_files(matched_list: list[dict[str, Any]], legacy: Any) -> list[str]:
-    seen = set()
-    html_files = []
-    for item in legacy.normalize_matched_list(matched_list):
-        html_file = item["html_file"]
-        if html_file in seen:
-            continue
-        seen.add(html_file)
-        html_files.append(html_file)
-    return html_files
+def expected_smil_files(matched_list: list[dict[str, Any]]) -> list[str]:
+    return [pipeline_core.make_overlay_basename(html) for html in unique_html_files(matched_list)]
 
 
 def epub_contains_segment_ids(epub_path: Path, html_files: list[str]) -> bool:
@@ -832,7 +796,6 @@ def reconcile_stage_from_artifacts(
     config: PipelineConfig,
     paths: RuntimePaths,
     state: dict[str, Any],
-    legacy: Any,
 ) -> dict[str, Any] | None:
     if stage == "prepare":
         book_info = ensure_prepare_state_from_artifacts(config, paths, state)
@@ -849,10 +812,10 @@ def reconcile_stage_from_artifacts(
         return None
 
     if stage == "split":
-        audio_files, chunks = expected_audio_files(legacy, book_info, paths.run_dir)
+        audio_files, chunks = expected_audio_files(book_info, paths.run_dir)
         if not audio_files:
             return None
-        if any(not legacy.is_audio_chunk_complete(book_info, chunk) for chunk in chunks):
+        if any(not pipeline_core.is_audio_chunk_complete(book_info, chunk) for chunk in chunks):
             return None
         state.setdefault("artifacts", {})["audio_files"] = audio_files
         return {
@@ -866,13 +829,13 @@ def reconcile_stage_from_artifacts(
     if stage == "transcribe":
         audio_files = state.get("artifacts", {}).get("audio_files")
         if not audio_files:
-            audio_files, _chunks = expected_audio_files(legacy, book_info, paths.run_dir)
+            audio_files, _chunks = expected_audio_files(book_info, paths.run_dir)
         if not audio_files:
             return None
         transcript_files = expected_transcript_files(audio_files)
         # Existence is not enough: a transcript must carry a stamp matching the
         # current model/language/backend and its parent chunk, or it is re-derived.
-        if any(not legacy.is_transcript_complete(book_info, name) for name in audio_files):
+        if any(not pipeline_core.is_transcript_complete(book_info, name) for name in audio_files):
             return None
         state.setdefault("artifacts", {})["audio_files"] = audio_files
         state["artifacts"]["transcript_files"] = transcript_files
@@ -884,7 +847,7 @@ def reconcile_stage_from_artifacts(
             return None
         audio_files = state.get("artifacts", {}).get("audio_files")
         if not audio_files:
-            audio_files, _chunks = expected_audio_files(legacy, book_info, paths.run_dir)
+            audio_files, _chunks = expected_audio_files(book_info, paths.run_dir)
         transcript_files = expected_transcript_files(audio_files)
         # The match is reusable only if it was computed over exactly the current
         # transcript set. Some transcripts legitimately match nothing (intro/outro
@@ -892,9 +855,12 @@ def reconcile_stage_from_artifacts(
         # test; compare against the input list the match stage recorded instead.
         if state.get("artifacts", {}).get("match_transcript_files") != transcript_files:
             return None
-        if not set(matched_json_files(matched_list, legacy)) <= set(transcript_files):
+        matched_json = {
+            item["json_file"] for item in pipeline_core.normalize_matched_list(matched_list)
+        }
+        if not matched_json <= set(transcript_files):
             return None
-        html_files = matched_html_files(matched_list, legacy)
+        html_files = unique_html_files(matched_list)
         state.setdefault("artifacts", {})["audio_files"] = audio_files
         state["artifacts"]["transcript_files"] = transcript_files
         state["artifacts"]["matched_html_files"] = html_files
@@ -904,7 +870,7 @@ def reconcile_stage_from_artifacts(
         matched_list = load_json_if_exists(paths.matched_list_path)
         if not matched_list:
             return None
-        html_files = matched_html_files(matched_list, legacy)
+        html_files = unique_html_files(matched_list)
         if not html_files:
             return None
         working_epub_path = paths.run_dir / book_info["out_file"]
@@ -923,7 +889,7 @@ def reconcile_stage_from_artifacts(
         matched_list = load_json_if_exists(paths.matched_list_path)
         if not matched_list:
             return None
-        smil_files = expected_smil_files(matched_list, legacy)
+        smil_files = expected_smil_files(matched_list)
         if not smil_files:
             return None
         if any(not (paths.run_dir / name).exists() for name in smil_files):
@@ -936,8 +902,8 @@ def reconcile_stage_from_artifacts(
             return None
         audio_files = state.get("artifacts", {}).get("audio_files")
         if not audio_files:
-            audio_files, _chunks = expected_audio_files(legacy, book_info, paths.run_dir)
-        smil_files = expected_smil_files(matched_list, legacy)
+            audio_files, _chunks = expected_audio_files(book_info, paths.run_dir)
+        smil_files = expected_smil_files(matched_list)
         # A candidate must be the very package this state recorded (byte identity),
         # not merely a processed EPUB with the right entry names: after a reset or
         # an upstream re-run, an older output with identical names would otherwise
@@ -952,7 +918,7 @@ def reconcile_stage_from_artifacts(
             return None
         package_candidates = [paths.output_path, paths.packaged_epub_path]
         for candidate in package_candidates:
-            package_info = legacy.inspect_epub_package(candidate)
+            package_info = pipeline_core.inspect_epub_package(candidate)
             if not package_info or not package_info.get("processed"):
                 continue
             zip_names = package_info.get("zip_names", set())
@@ -994,7 +960,6 @@ def run_prepare_stage(
     config: PipelineConfig,
     paths: RuntimePaths,
     state: dict[str, Any],
-    legacy: Any,
     logger: logging.Logger,
 ) -> dict[str, Any]:
     paths.run_dir.mkdir(parents=True, exist_ok=True)
@@ -1005,22 +970,8 @@ def run_prepare_stage(
     atomic_copy(config.audio, copied_audio)
     atomic_copy(config.epub, copied_epub)
 
-    book_info = {
-        "folder_name": str(paths.run_dir),
-        "audio_file": copied_audio.name,
-        "audio_extension": config.audio_extension,
-        "audio_codec": config.audio_codec,
-        "audio_bitrate": config.audio_bitrate,
-        "audio_sample_rate": config.audio_sample_rate,
-        "audio_channels": config.audio_channels,
-        "split_jobs": config.split_jobs,
-        "chunk_seconds": config.chunk_seconds,
-        "batch_size": config.batch_size,
-        "backend": config.backend,
-        "model": config.model,
-        "language": config.language,
-    }
-    audio_file, _epub_file, out_file = legacy.preprocess(book_info, copied_epub)
+    book_info = book_info_from_config(config, paths)
+    audio_file, _epub_file, out_file = pipeline_core.preprocess(book_info, copied_epub)
     book_info.update({"audio_file": audio_file, "epub_file": out_file, "out_file": out_file})
 
     state["book_info"] = book_info
@@ -1036,13 +987,12 @@ def run_prepare_stage(
 def run_split_stage(
     paths: RuntimePaths,
     state: dict[str, Any],
-    legacy: Any,
     logger: logging.Logger,
 ) -> dict[str, Any]:
     book_info = build_book_info(state, paths)
-    audio_files, chunks = expected_audio_files(legacy, book_info, paths.run_dir)
-    split_stats = legacy.split_audio(book_info)
-    invalid = [chunk["output_name"] for chunk in chunks if not legacy.is_audio_chunk_complete(book_info, chunk)]
+    audio_files, chunks = expected_audio_files(book_info, paths.run_dir)
+    split_stats = pipeline_core.split_audio(book_info)
+    invalid = [chunk["output_name"] for chunk in chunks if not pipeline_core.is_audio_chunk_complete(book_info, chunk)]
     if invalid:
         raise RuntimeError(f"Audio split stage did not produce all expected valid chunks: {invalid}")
     state["artifacts"]["audio_files"] = audio_files
@@ -1072,7 +1022,6 @@ def run_transcribe_stage(
     config: PipelineConfig,
     paths: RuntimePaths,
     state: dict[str, Any],
-    legacy: Any,
     logger: logging.Logger,
 ) -> dict[str, Any]:
     book_info = build_book_info(state, paths)
@@ -1085,11 +1034,11 @@ def run_transcribe_stage(
     if applied_cache_gb is not None:
         logger.info("mlx Metal cache limit set to %.1f GB", applied_cache_gb)
 
-    legacy.transcribe_audio(book_info)
+    pipeline_core.transcribe_audio(book_info)
 
     audio_files = state.get("artifacts", {}).get("audio_files")
     if not audio_files:
-        audio_files, _chunks = expected_audio_files(legacy, book_info, paths.run_dir)
+        audio_files, _chunks = expected_audio_files(book_info, paths.run_dir)
     transcript_files = [Path(name).with_suffix(".json").name for name in audio_files]
     missing = [name for name in transcript_files if not (paths.run_dir / name).exists()]
     if missing:
@@ -1102,17 +1051,16 @@ def run_transcribe_stage(
 def run_match_stage(
     paths: RuntimePaths,
     state: dict[str, Any],
-    legacy: Any,
     logger: logging.Logger,
 ) -> dict[str, Any]:
     book_info = build_book_info(state, paths)
-    matched_list = legacy.link_html_with_audio(book_info)
+    matched_list = pipeline_core.link_html_with_audio(book_info)
     if not matched_list:
         raise RuntimeError("Matching stage produced an empty matched list")
     atomic_write_json(paths.matched_list_path, matched_list)
-    html_files = matched_html_files(matched_list, legacy)
+    html_files = unique_html_files(matched_list)
     state["artifacts"]["matched_html_files"] = html_files
-    audio_files, _chunks = expected_audio_files(legacy, book_info, paths.run_dir)
+    audio_files, _chunks = expected_audio_files(book_info, paths.run_dir)
     state["artifacts"]["match_transcript_files"] = expected_transcript_files(audio_files)
     logger.info("Matching complete with %d transcript-to-HTML links", len(matched_list))
     return {"match_count": len(matched_list), "html_files": html_files}
@@ -1122,35 +1070,20 @@ def run_segment_stage(
     config: PipelineConfig,
     paths: RuntimePaths,
     state: dict[str, Any],
-    legacy: Any,
     logger: logging.Logger,
 ) -> dict[str, Any]:
+    # Reconcile already reused an existing segmented snapshot/working EPUB when one
+    # was valid; reaching this point means the working EPUB must be refreshed from
+    # the source copy and re-marked.
     matched_list = load_matched_list(paths)
-    html_files = matched_html_files(matched_list, legacy)
-    out_file = state["book_info"]["out_file"]
-    working_epub_path = paths.run_dir / out_file
+    html_files = unique_html_files(matched_list)
+    working_epub_path = paths.working_epub_path
 
-    if paths.segmented_snapshot_path.exists() and epub_contains_segment_ids(paths.segmented_snapshot_path, html_files):
-        if not epub_contains_segment_ids(working_epub_path, html_files):
-            restore_segmented_working_epub(state, paths)
-        logger.info("Reusing existing segmented EPUB snapshot")
-        return {"html_files": html_files, "snapshot": str(paths.segmented_snapshot_path)}
-
-    if epub_contains_segment_ids(working_epub_path, html_files):
-        atomic_copy(working_epub_path, paths.segmented_snapshot_path)
-        logger.info("Recovered segmented EPUB snapshot from existing working EPUB")
-        return {"html_files": html_files, "snapshot": str(paths.segmented_snapshot_path)}
-
-    book_info = refresh_working_epub(
-        legacy,
-        build_book_info(state, paths, matched_list),
-        paths.run_dir,
-        paths.run_dir / config.epub.name,
-    )
+    book_info = refresh_working_epub(config, paths)
     book_info["matched_list"] = matched_list
     state["book_info"] = {k: v for k, v in book_info.items() if k != "matched_list"}
 
-    legacy.mark_segments(book_info)
+    pipeline_core.mark_segments(book_info)
 
     if not epub_contains_segment_ids(working_epub_path, html_files):
         raise RuntimeError("Segmented working EPUB did not contain the expected segment IDs")
@@ -1162,19 +1095,18 @@ def run_segment_stage(
 def run_smil_stage(
     paths: RuntimePaths,
     state: dict[str, Any],
-    legacy: Any,
     logger: logging.Logger,
 ) -> dict[str, Any]:
     matched_list = load_matched_list(paths)
-    expected_files = expected_smil_files(matched_list, legacy)
+    expected_files = expected_smil_files(matched_list)
     if not expected_files:
         raise RuntimeError("No expected SMIL files could be derived from the matched list")
-    html_files = matched_html_files(matched_list, legacy)
+    html_files = unique_html_files(matched_list)
     if not epub_contains_segment_ids(paths.run_dir / state["book_info"]["out_file"], html_files):
         restore_segmented_working_epub(state, paths)
 
     book_info = build_book_info(state, paths, matched_list)
-    legacy.create_smil_files(book_info)
+    pipeline_core.create_smil_files(book_info)
 
     missing = [name for name in expected_files if not (paths.run_dir / name).exists()]
     if missing:
@@ -1187,7 +1119,6 @@ def run_package_stage(
     config: PipelineConfig,
     paths: RuntimePaths,
     state: dict[str, Any],
-    legacy: Any,
     logger: logging.Logger,
 ) -> dict[str, Any]:
     matched_list = load_matched_list(paths)
@@ -1195,16 +1126,16 @@ def run_package_stage(
     delete_path(paths.packaged_epub_path)
 
     book_info = build_book_info(state, paths, matched_list)
-    legacy.merge_files(book_info)
-    legacy.post_processing_opf(book_info, paths.packaged_epub_path)
+    pipeline_core.merge_files(book_info)
+    pipeline_core.post_processing_opf(book_info, paths.packaged_epub_path)
 
     if not paths.packaged_epub_path.exists():
         raise RuntimeError(f"Packaged EPUB not found after packaging stage: {paths.packaged_epub_path}")
-    atomic_copy(paths.packaged_epub_path, config.output_path)
-    logger.info("Packaged final EPUB at %s", config.output_path)
+    atomic_copy(paths.packaged_epub_path, paths.output_path)
+    logger.info("Packaged final EPUB at %s", paths.output_path)
     return {
         "packaged_epub": str(paths.packaged_epub_path),
-        "output_epub": str(config.output_path),
+        "output_epub": str(paths.output_path),
         # Byte identity of the package, so reconcile only ever reuses this exact file.
         "packaged_fingerprint": content_fingerprint(paths.packaged_epub_path),
     }
@@ -1213,14 +1144,11 @@ def run_package_stage(
 def run_validate_stage(
     paths: RuntimePaths,
     state: dict[str, Any],
-    legacy: Any,
     logger: logging.Logger,
 ) -> dict[str, Any]:
-    if not paths.packaged_epub_path.exists() and paths.output_path.exists():
-        atomic_copy(paths.output_path, paths.packaged_epub_path)
     matched_list = load_matched_list(paths) if paths.matched_list_path.exists() else None
     book_info = build_book_info(state, paths, matched_list)
-    results = legacy.run_post_checks(book_info)
+    results = pipeline_core.run_post_checks(book_info)
     # Bind the result to the exact EPUB it validated so a later run that rebuilds (or
     # deletes) the packaged EPUB cannot reuse this stale result via reconcile.
     results["validated_epub"] = content_fingerprint(paths.packaged_epub_path)
@@ -1234,25 +1162,24 @@ def execute_stage(
     config: PipelineConfig,
     paths: RuntimePaths,
     state: dict[str, Any],
-    legacy: Any,
     logger: logging.Logger,
 ) -> dict[str, Any]:
     if stage == "prepare":
-        return run_prepare_stage(config, paths, state, legacy, logger)
+        return run_prepare_stage(config, paths, state, logger)
     if stage == "split":
-        return run_split_stage(paths, state, legacy, logger)
+        return run_split_stage(paths, state, logger)
     if stage == "transcribe":
-        return run_transcribe_stage(config, paths, state, legacy, logger)
+        return run_transcribe_stage(config, paths, state, logger)
     if stage == "match":
-        return run_match_stage(paths, state, legacy, logger)
+        return run_match_stage(paths, state, logger)
     if stage == "segment":
-        return run_segment_stage(config, paths, state, legacy, logger)
+        return run_segment_stage(config, paths, state, logger)
     if stage == "smil":
-        return run_smil_stage(paths, state, legacy, logger)
+        return run_smil_stage(paths, state, logger)
     if stage == "package":
-        return run_package_stage(config, paths, state, legacy, logger)
+        return run_package_stage(config, paths, state, logger)
     if stage == "validate":
-        return run_validate_stage(paths, state, legacy, logger)
+        return run_validate_stage(paths, state, logger)
     raise RuntimeError(f"Unknown stage: {stage}")
 
 
@@ -1264,10 +1191,8 @@ def run_pipeline(config: PipelineConfig) -> int:
     log_run_header(logger, config, paths, mode)
     started_at = time.monotonic()
 
-    legacy = load_pipeline_module()
-
     for index, stage in enumerate(STAGES, start=1):
-        reconciled_result = reconcile_stage_from_artifacts(stage, config, paths, state, legacy)
+        reconciled_result = reconcile_stage_from_artifacts(stage, config, paths, state)
         if reconciled_result is not None:
             if stage_status(state, stage) != "success" or state["stages"].get(stage, {}).get("result") != reconciled_result:
                 set_stage_state(state, stage, "success", result=reconciled_result)
@@ -1281,7 +1206,7 @@ def run_pipeline(config: PipelineConfig) -> int:
         stage_started_at = time.monotonic()
 
         try:
-            result = execute_stage(stage, config, paths, state, legacy, logger)
+            result = execute_stage(stage, config, paths, state, logger)
         except Exception as exc:
             elapsed = time.monotonic() - stage_started_at
             set_stage_state(

@@ -34,7 +34,6 @@ def _config_and_paths(tmp_path: Path):
         audio=audio,
         epub=epub,
         output_dir=src_dir,
-        output_path=src_dir / "book.media-overlay.epub",
         work_dir=work,
         backend="mlx",
         model="m",
@@ -179,7 +178,7 @@ def test_package_reconcile_rejects_unrecorded_package(tmp_path):
     config, paths = _config_and_paths(tmp_path)
     state = _prepared_state(config, paths)
     _processed_epub(paths.output_path)  # looks complete, but this state never built it
-    assert geo.reconcile_stage_from_artifacts("package", config, paths, state, pc) is None
+    assert geo.reconcile_stage_from_artifacts("package", config, paths, state) is None
 
 
 def test_package_reconcile_accepts_only_the_recorded_bytes(tmp_path):
@@ -191,14 +190,14 @@ def test_package_reconcile_accepts_only_the_recorded_bytes(tmp_path):
         state, "package", "success", result={"packaged_fingerprint": fingerprint}
     )
 
-    result = geo.reconcile_stage_from_artifacts("package", config, paths, state, pc)
+    result = geo.reconcile_stage_from_artifacts("package", config, paths, state)
     assert result is not None and result["packaged_fingerprint"] == fingerprint
     assert paths.output_path.exists(), "missing output is backfilled from the packaged copy"
 
     # A rebuilt package with different bytes is not the recorded one.
     _processed_epub(paths.packaged_epub_path, marker=b"changed")
     _processed_epub(paths.output_path, marker=b"changed")
-    assert geo.reconcile_stage_from_artifacts("package", config, paths, state, pc) is None
+    assert geo.reconcile_stage_from_artifacts("package", config, paths, state) is None
 
 
 # --- match reconcile -------------------------------------------------------
@@ -220,7 +219,7 @@ def test_match_reconcile_accepts_unmatched_intro_transcript(tmp_path):
     state = _state_for_match(
         config, paths, matched, ["000.m4a", "001.m4a"], ["000.json", "001.json"]
     )
-    result = geo.reconcile_stage_from_artifacts("match", config, paths, state, pc)
+    result = geo.reconcile_stage_from_artifacts("match", config, paths, state)
     assert result is not None and result["match_count"] == 1
 
 
@@ -231,11 +230,11 @@ def test_match_reconcile_rejects_when_transcript_set_changed(tmp_path):
     state = _state_for_match(
         config, paths, matched, ["000.m4a", "001.m4a", "002.m4a"], ["000.json", "001.json"]
     )
-    assert geo.reconcile_stage_from_artifacts("match", config, paths, state, pc) is None
+    assert geo.reconcile_stage_from_artifacts("match", config, paths, state) is None
 
 
 def test_match_reconcile_rejects_without_recorded_inputs(tmp_path):
     config, paths = _config_and_paths(tmp_path)
     matched = [{"json_file": "001.json", "html_file": "OEBPS/ch1.xhtml"}]
     state = _state_for_match(config, paths, matched, ["000.m4a", "001.m4a"], None)
-    assert geo.reconcile_stage_from_artifacts("match", config, paths, state, pc) is None
+    assert geo.reconcile_stage_from_artifacts("match", config, paths, state) is None
