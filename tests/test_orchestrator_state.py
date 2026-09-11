@@ -238,3 +238,23 @@ def test_match_reconcile_rejects_without_recorded_inputs(tmp_path):
     matched = [{"json_file": "001.json", "html_file": "OEBPS/ch1.xhtml"}]
     state = _state_for_match(config, paths, matched, ["000.m4a", "001.m4a"], None)
     assert geo.reconcile_stage_from_artifacts("match", config, paths, state) is None
+
+
+# --- split reconcile prunes stale chunks ---------------------------------------
+
+
+def test_split_reconcile_prunes_chunks_outside_the_plan(tmp_path, monkeypatch):
+    config, paths = _config_and_paths(tmp_path)
+    state = _prepared_state(config, paths)
+    plan = [{"id": 0, "start_time": "0", "end_time": "600", "output_name": "000.m4a"}]
+    monkeypatch.setattr(pc, "plan_audio_chunks", lambda book_info, audio_path=None: plan)
+    monkeypatch.setattr(pc, "is_audio_chunk_complete", lambda *a, **k: True)
+    for name in ("000.m4a", "000.json", "099.m4a", "099.json", "099.json.meta"):
+        (paths.run_dir / name).write_bytes(b"\x00")
+
+    result = geo.reconcile_stage_from_artifacts("split", config, paths, state)
+
+    assert result is not None and result["pruned_chunk_count"] == 1
+    assert not (paths.run_dir / "099.m4a").exists()
+    assert not (paths.run_dir / "099.json").exists()
+    assert (paths.run_dir / "000.json").exists()

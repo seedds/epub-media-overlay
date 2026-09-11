@@ -816,6 +816,9 @@ def reconcile_stage_from_artifacts(
             return None
         if any(not pipeline_core.is_audio_chunk_complete(book_info, chunk) for chunk in chunks):
             return None
+        # Reusing the planned chunks must still clear out chunk files from an older
+        # plan; split_audio does this too, but it only runs when reconcile fails.
+        pruned = pipeline_core.prune_stale_chunk_artifacts(book_info, chunks)
         state.setdefault("artifacts", {})["audio_files"] = audio_files
         return {
             "audio_files": audio_files,
@@ -823,6 +826,7 @@ def reconcile_stage_from_artifacts(
             "reused_chunk_count": len(audio_files),
             "regenerated_chunk_count": 0,
             "created_chunk_count": 0,
+            "pruned_chunk_count": pruned,
         }
 
     if stage == "transcribe":
