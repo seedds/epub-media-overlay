@@ -488,9 +488,12 @@ def preprocess_remove_redundant_tags(
     The two `referenced_*` sets come from `epub_reference_index.build_reference_index`
     and name every `class`/`id` used by any stylesheet, link/nav fragment, or script.
     Anything not named there does nothing, so it is safe to remove without changing
-    visible text, layout, style, navigation, or scripted behaviour. With empty sets
-    (the default) only genuinely inert, attribute-free markup is touched, which keeps
-    the function usable and testable in isolation.
+    visible text, layout, style, navigation, or scripted behaviour.
+
+    WARNING: the sets are treated as complete. An *empty* set means "nothing in the
+    book references any class/id", so every class and id is stripped. Callers that
+    could not build the index must not call this function (see `mark_sentences`,
+    which skips cleanup when the sets are None) rather than pass empty sets.
 
     The passes run in order because they compose:
 
@@ -517,15 +520,26 @@ def mark_sentences(
     chapter_id: str = "chapter",
     language: str = "english",
     min_words: int = 1,
-    referenced_classes: frozenset = frozenset(),
-    referenced_ids: frozenset = frozenset(),
+    referenced_classes: frozenset | None = None,
+    referenced_ids: frozenset | None = None,
 ) -> str:
-    """Segment content by wrapping text in segment spans. Preserves structure and void tags."""
+    """Segment content by wrapping text in segment spans. Preserves structure and void tags.
 
-    # Stage 1: remove markup/attributes that nothing in the EPUB references.
-    cleaned_html = preprocess_remove_redundant_tags(
-        html_content, referenced_classes, referenced_ids
-    )
+    `referenced_classes`/`referenced_ids` are the whole-EPUB reference sets from
+    `epub_reference_index`. When either is None the index is unknown and the
+    redundant-markup cleanup is skipped entirely (nothing is stripped). Passing
+    explicit sets, including empty ones, enables the cleanup with those sets taken
+    as complete.
+    """
+
+    # Stage 1: remove markup/attributes that nothing in the EPUB references. Only
+    # when the reference index is known; an unknown index must never strip anything.
+    if referenced_classes is None or referenced_ids is None:
+        cleaned_html = html_content
+    else:
+        cleaned_html = preprocess_remove_redundant_tags(
+            html_content, referenced_classes, referenced_ids
+        )
 
     # Stage 2: parse the full cleaned document.
     soup = BeautifulSoup(cleaned_html, "lxml")

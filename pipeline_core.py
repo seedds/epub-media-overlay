@@ -1364,24 +1364,29 @@ def link_html_with_audio(book_info):
 
 
 def _load_reference_sets(zip_file, book_info):
-    """Build (referenced_classes, referenced_ids) for the whole EPUB.
+    """Build (referenced_classes, referenced_ids) for the whole EPUB, or None.
 
-    These drive `preprocess_remove_redundant_tags`. On any failure we return empty
-    sets, which makes the cleaner conservative (it will not remove anything rather
-    than risk deleting a referenced class/id).
+    These drive `mark_sentences`' redundant-markup cleanup. The cleaner treats the
+    sets as complete, so an empty set would strip *every* class and id. When the
+    index cannot be built (no OPF recorded, unreadable OPF, indexer error) return
+    None so the caller skips cleanup altogether instead of destroying the markup.
     """
     opf_file = book_info.get("opf_file")
     opf_dir = book_info.get("opf_dir") or "."
     if not opf_file:
-        return frozenset(), frozenset()
+        warnings.warn("No OPF recorded in book_info; skipping redundant-markup cleanup")
+        return None
     try:
         with zip_file.open(opf_file) as handle:
             opf_soup = BeautifulSoup(handle.read(), "xml")
         index = build_reference_index(zip_file, opf_soup, opf_dir)
         return index.referenced_classes, index.referenced_ids
     except Exception as error:
-        warnings.warn(f"Could not build EPUB reference index: {error}")
-        return frozenset(), frozenset()
+        warnings.warn(
+            f"Could not build EPUB reference index ({error!r}); "
+            "skipping redundant-markup cleanup"
+        )
+        return None
 
 
 def mark_segments(book_info):
@@ -1398,7 +1403,8 @@ def mark_segments(book_info):
     )
 
     with zipfile.ZipFile(book_info["out_file"], "r") as f:
-        referenced_classes, referenced_ids = _load_reference_sets(f, book_info)
+        reference_sets = _load_reference_sets(f, book_info)
+        referenced_classes, referenced_ids = reference_sets or (None, None)
         processed_html_files = set()
         for item in matched_items:
             html_file_name = item["html_file"]
