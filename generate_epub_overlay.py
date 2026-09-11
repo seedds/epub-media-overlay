@@ -86,6 +86,7 @@ class RuntimePaths:
     matched_list_path: Path
     segmented_snapshot_path: Path
     validation_path: Path
+    working_epub_path: Path
     packaged_epub_path: Path
     output_path: Path
 
@@ -469,6 +470,7 @@ def build_paths(config: PipelineConfig) -> RuntimePaths:
         matched_list_path=config.work_dir / "matched_list.json",
         segmented_snapshot_path=config.work_dir / "segmented.epub3",
         validation_path=config.work_dir / "validation.json",
+        working_epub_path=run_dir / config.epub.with_suffix(".epub3").name,
         packaged_epub_path=config.work_dir / source_output_name,
         output_path=config.output_path,
     )
@@ -503,39 +505,73 @@ def preflight(config: PipelineConfig, logger: logging.Logger) -> None:
     ensure_nltk_resources(logger)
 
 
-def reset_derived_artifacts(paths: RuntimePaths, source_epub: Path | None = None) -> None:
-    """Remove derived downstream artifacts while preserving the expensive
-    split/transcribe outputs in run/ (audio chunks and transcript JSON).
+def derived_artifact_paths(stage: str, paths: RuntimePaths) -> list[Path]:
+    """Files a stage produces that must be regenerated when anything upstream changes.
 
-    This is used when the saved work state no longer matches the current inputs.
-    Transcription is expensive and non-deterministic, so transcripts are never
-    destroyed automatically; the stage reconcile step re-validates every artifact
-    against the current config on the next run (via the compatibility stamps written
-    alongside each chunk/transcript) and re-derives whatever is stale.
-
-    `source_epub` guards against deleting the user's input file when --work-dir
-    points at the folder that contains the source EPUB (the packaged working EPUB
-    and the source can then share a path).
+    Audio chunks and transcripts (split/transcribe) are deliberately absent: they are
+    expensive, and their per-artifact compatibility stamps already decide reuse.
+    The segment stage's derived state includes the working EPUB because it carries
+    the injected segment ids; deleting it makes the segment stage refresh from the
+    source copy before re-marking.
     """
-    for target in (paths.matched_list_path, paths.segmented_snapshot_path, paths.validation_path):
-        if target.is_file():
+    if stage == "match":
+        return [paths.matched_list_path]
+    if stage == "segment":
+        return [paths.segmented_snapshot_path, paths.working_epub_path]
+    if stage == "smil":
+        return sorted(paths.run_dir.glob("*.smil")) if paths.run_dir.is_dir() else []
+    if stage == "package":
+        return [paths.packaged_epub_path, paths.output_path]
+    if stage == "validate":
+        return [paths.validation_path]
+    return []
+
+
+def remove_derived_artifacts(stages: list[str], paths: RuntimePaths, source_epub: Path) -> None:
+    """Delete the derived artifacts of `stages`, never touching the source EPUB.
+
+    Only explicitly known paths are removed (no wildcard over user-controlled
+    directories): `--work-dir` may point at a folder holding unrelated EPUBs, and the
+    packaged/output EPUB can share a path with the source when the work dir is the
+    source folder.
+    """
+    source_resolved = source_epub.resolve()
+    for stage in stages:
+        for target in derived_artifact_paths(stage, paths):
+            if not target.is_file():
+                continue
+            if target.resolve() == source_resolved:
+                continue
             target.unlink()
 
-    # Packaged working EPUB lives at the work-dir root as <stem>.epub. Never delete
-    # the source EPUB itself if it happens to live at the work-dir root.
-    source_resolved = source_epub.resolve() if source_epub is not None else None
-    for packaged in sorted(paths.root.glob("*.epub")):
-        if not packaged.is_file():
-            continue
-        if source_resolved is not None and packaged.resolve() == source_resolved:
-            continue
-        packaged.unlink()
 
-    # SMIL files generated into the run dir.
-    if paths.run_dir.is_dir():
-        for smil_file in sorted(paths.run_dir.glob("*.smil")):
-            if smil_file.is_file():
-                smil_file.unlink()
+def reset_derived_artifacts(paths: RuntimePaths, source_epub: Path) -> None:
+    """Remove every derived downstream artifact while preserving the expensive
+    split/transcribe outputs in run/ (audio chunks and transcript JSON).
+
+    Used when the saved work state no longer matches the current inputs. Transcripts
+    are never destroyed automatically; the stage reconcile step re-validates every
+    chunk/transcript against the current config via its compatibility stamp and
+    re-derives whatever is stale.
+    """
+    remove_derived_artifacts([s for s in STAGES if s not in ("prepare", "split", "transcribe")], paths, source_epub)
+
+
+def invalidate_downstream(stage: str, config: PipelineConfig, paths: RuntimePaths, state: dict[str, Any]) -> None:
+    """After `stage` actually executed, everything derived after it is stale.
+
+    Deletes the downstream derived artifacts and resets those stages to pending so
+    reconcile cannot accept, e.g., a packaged EPUB built from the previous SMIL set.
+    `prepare` is exempt: it re-runs after every completed run (packaging moves the
+    working EPUB away) without changing any input.
+    """
+    if stage == "prepare":
+        return
+    downstream = STAGES[STAGES.index(stage) + 1 :]
+    remove_derived_artifacts(list(downstream), paths, config.epub)
+    for later in downstream:
+        if stage_status(state, later) != "pending":
+            set_stage_state(state, later, "pending")
 
 
 def initialize_state(config: PipelineConfig, paths: RuntimePaths) -> tuple[dict[str, Any], str]:
@@ -923,6 +959,18 @@ def reconcile_stage_from_artifacts(
         if not audio_files:
             audio_files, _chunks = expected_audio_files(legacy, book_info, paths.run_dir)
         smil_files = expected_smil_files(matched_list, legacy)
+        # A candidate must be the very package this state recorded (byte identity),
+        # not merely a processed EPUB with the right entry names: after a reset or
+        # an upstream re-run, an older output with identical names would otherwise
+        # be accepted and copied back as the result.
+        package_record = state.get("stages", {}).get("package", {})
+        recorded_fingerprint = (
+            package_record.get("result", {}).get("packaged_fingerprint")
+            if package_record.get("status") == "success"
+            else None
+        )
+        if not recorded_fingerprint:
+            return None
         package_candidates = [paths.output_path, paths.packaged_epub_path]
         for candidate in package_candidates:
             package_info = legacy.inspect_epub_package(candidate)
@@ -933,6 +981,8 @@ def reconcile_stage_from_artifacts(
                 continue
             if any(f"smil/{name}" not in zip_names for name in smil_files):
                 continue
+            if content_fingerprint(candidate) != recorded_fingerprint:
+                continue
             if not paths.output_path.exists() and candidate == paths.packaged_epub_path:
                 atomic_copy(paths.packaged_epub_path, paths.output_path)
             if not paths.packaged_epub_path.exists() and candidate == paths.output_path:
@@ -940,6 +990,7 @@ def reconcile_stage_from_artifacts(
             return {
                 "packaged_epub": str(paths.packaged_epub_path),
                 "output_epub": str(paths.output_path),
+                "packaged_fingerprint": recorded_fingerprint,
             }
         return None
 
@@ -1178,6 +1229,8 @@ def run_package_stage(
     return {
         "packaged_epub": str(paths.packaged_epub_path),
         "output_epub": str(config.output_path),
+        # Byte identity of the package, so reconcile only ever reuses this exact file.
+        "packaged_fingerprint": content_fingerprint(paths.packaged_epub_path),
     }
 
 
@@ -1267,6 +1320,7 @@ def run_pipeline(config: PipelineConfig) -> int:
             logger.info("Detailed log: %s", paths.logs_dir / "pipeline.log")
             return 1
 
+        invalidate_downstream(stage, config, paths, state)
         set_stage_state(state, stage, "success", result=result)
         save_state(paths, state)
         logger.info(
