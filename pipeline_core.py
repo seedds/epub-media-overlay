@@ -1944,6 +1944,14 @@ def finalize_segment_timestamps(matched_ordered_list, total_duration, anchor_sta
     matched_ordered_list = [dict(item) for item in matched_ordered_list]
 
     if matched_ordered_list:
+        # Envelopes can be non-monotonic (a jagged difflib run, or punctuation-only
+        # spans matched out of order). Closing gaps from such starts would give the
+        # earlier segment a negative clip (dropped from the SMIL) and let its
+        # neighbours overlap. Clamp each start to never precede the previous one.
+        for i in range(1, len(matched_ordered_list)):
+            previous_start = matched_ordered_list[i - 1]["start"]
+            if matched_ordered_list[i]["start"] < previous_start:
+                matched_ordered_list[i]["start"] = previous_start
         for i in range(len(matched_ordered_list) - 1):
             matched_ordered_list[i]["end"] = matched_ordered_list[i + 1]["start"]
 
@@ -3241,14 +3249,18 @@ def anchor_audio_file_tails(aggregated_matches_by_html, book_info):
             clip["end"] = duration
 
 
-def create_smil_files(book_info, skip=True):
+def create_smil_files(book_info):
     # Output model:
     # one HTML file -> one SMIL file, even when several audio chunks contribute to it.
+    #
+    # Every SMIL is regenerated: seam resolution (resolve_segment_clips) and tail
+    # anchoring work across files, so a SMIL left over from an interrupted or older
+    # run would be inconsistent with its freshly generated neighbours. Skipping the
+    # whole stage when its outputs are complete is the orchestrator's job.
     matched_items = sort_matched_items(book_info["matched_list"])
     working_epub = resolve_book_path(book_info, book_info["out_file"])
-    if not skip:
-        for file in iter_smil_files(book_info):
-            os.remove(resolve_book_path(book_info, file))
+    for file in iter_smil_files(book_info):
+        os.remove(resolve_book_path(book_info, file))
 
     alignment_stats = {
         "no_audio_tokens": 0,
@@ -3434,10 +3446,7 @@ def create_smil_files(book_info, skip=True):
     anchor_audio_file_tails(aggregated_matches_by_html, book_info)
 
     for html_file in tqdm(matched_html_files, desc="Writing SMIL", unit="file"):
-        smil_filename = make_overlay_basename(html_file)
-        smil_path = resolve_book_path(book_info, smil_filename)
-        if os.path.exists(smil_path) and skip:
-            continue
+        smil_path = resolve_book_path(book_info, make_overlay_basename(html_file))
 
         segments, _html_tokens = load_html_segments_and_tokens(working_epub, html_file)
         aggregated_matches = aggregated_matches_by_html.get(html_file, {})

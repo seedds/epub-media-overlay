@@ -1047,3 +1047,22 @@ def test_audio_coverage_gaps_skips_without_smils():
     assert result["skipped"] is True
     assert result["ok"] is True
 
+
+
+# --- finalize_segment_timestamps: monotonic clamp ----------------------------
+
+
+def test_finalize_clamps_non_monotonic_starts():
+    # Segment 2's envelope starts before segment 1's. Without the clamp, segment 1
+    # gets end < start (dropped) and segments 0 and 2 overlap.
+    matched = [
+        {"id": "s0", "segment_index": 0, "start": 0.0, "end": 4.0},
+        {"id": "s1", "segment_index": 1, "start": 4.0, "end": 6.0},
+        {"id": "s2", "segment_index": 2, "start": 3.0, "end": 8.0},
+        {"id": "s3", "segment_index": 3, "start": 8.0, "end": 9.0},
+    ]
+    final = pc.finalize_segment_timestamps(matched, 10.0)
+    assert all(item["end"] >= item["start"] for item in final)
+    assert_no_overlapping_clips(final)
+    assert [item["start"] for item in final] == [0.0, 4.0, 4.0, 8.0]
+    assert final[-1]["end"] == 10.0

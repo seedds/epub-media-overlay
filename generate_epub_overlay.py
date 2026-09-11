@@ -1174,7 +1174,7 @@ def run_smil_stage(
         restore_segmented_working_epub(state, paths)
 
     book_info = build_book_info(state, paths, matched_list)
-    legacy.create_smil_files(book_info, skip=True)
+    legacy.create_smil_files(book_info)
 
     missing = [name for name in expected_files if not (paths.run_dir / name).exists()]
     if missing:
