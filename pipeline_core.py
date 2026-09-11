@@ -26,7 +26,8 @@ Operational constraints:
 - EPUB spine order is authoritative for reading order; filename order is not
 - an audio chunk may start in the middle of an HTML file
 - multiple audio chunks may map to the same HTML file
-- the working `.epub3` and the final `.epub` are not always the same path
+- every path in `book_info` is a basename resolved against `folder_name` via
+  `resolve_book_path`; nothing depends on the process working directory
 - validation must inspect both loose working artifacts and packaged EPUB contents
 
 Pipeline overview
@@ -87,7 +88,8 @@ Typical keys include:
 - `folder_name`: working directory for one book
 - `audio_file`: source audiobook path/name
 - `epub_file`: working EPUB path/name used for matching
-- `out_file`: working `.epub3` file that gets mutated and later moved
+- `out_file`: working `.epub3` file (basename inside `folder_name`) that gets
+  mutated and finally moved to the caller-supplied package path
 - `opf_file`, `opf_dir`: package metadata derived from the working EPUB
 - `audio_extension`: output split-audio extension, usually `.m4a`
 - `audio_codec`: split-audio codec profile, usually `copy`
@@ -201,36 +203,27 @@ def split_audio_duration_tolerance(book_info):
 # === EPUB and ZIP helpers ===
 
 
-def preprocess(book_info):
+def preprocess(book_info, source_epub_path):
     # Working model:
     # - source `.epub` remains untouched
-    # - all mutations happen against a copied `.epub3`
-    # - final packaging later moves that working copy to a final `.epub`
-    epub_file = glob.glob("*.epub")[0]
+    # - all mutations happen against a copied `.epub3` inside the book folder
+    # - final packaging later moves that working copy to a caller-supplied path
     audio_file = book_info.get("audio_file")
     if not audio_file:
-        audio_candidates = [
-            file_name
-            for file_name in glob.glob("*")
-            if os.path.isfile(file_name) and file_name != epub_file
-        ]
-        if not audio_candidates:
-            raise FileNotFoundError("No source audio file found in working directory")
-        audio_file = audio_candidates[0]
-    out_file = epub_file.replace(".epub", ".epub3")
-    shutil.copy(epub_file, out_file)
+        raise FileNotFoundError("book_info['audio_file'] must name the source audio")
+    epub_file = os.path.basename(str(source_epub_path))
+    out_file = os.path.splitext(epub_file)[0] + ".epub3"
+    out_path = resolve_book_path(book_info, out_file)
+    shutil.copy(str(source_epub_path), out_path)
 
-    with zipfile.ZipFile(out_file, "a") as f:
-        for file_name in f.namelist():
-            if ".opf" in file_name:
-                break
-        assert ".opf" in file_name
+    with zipfile.ZipFile(out_path, "r") as f:
+        opf_file = next((name for name in f.namelist() if name.endswith(".opf")), None)
+    if not opf_file:
+        raise ValueError(f"No OPF package document found in {source_epub_path}")
 
-    book_info["opf_file"] = file_name
-    book_info["opf_dir"] = posixpath.dirname(file_name) or "."
-    root_level = len(list(Path(file_name).parents))
-
-    return audio_file, epub_file, out_file, root_level
+    book_info["opf_file"] = opf_file
+    book_info["opf_dir"] = posixpath.dirname(opf_file) or "."
+    return audio_file, epub_file, out_file
 
 
 def plan_audio_chunks(book_info, audio_path=None):
@@ -857,14 +850,16 @@ def transcribe_audio(book_info):
         unit="chunk",
     ):
         json_file = transcript_basename(file, book_info["audio_extension"])
+        chunk_path = resolve_book_path(book_info, file)
+        json_path = resolve_book_path(book_info, json_file)
         # Skip only if a prior transcript exists AND its stamp matches the current
         # model/language/backend AND references the current chunk stamp. A stampless
         # or mismatched transcript (different config, or a crash-truncated file that
         # never got its stamp) is re-transcribed rather than silently reused.
         expected_stamp = transcript_compatibility_stamp(
-            book_info, read_compatibility_stamp(file)
+            book_info, read_compatibility_stamp(chunk_path)
         )
-        if os.path.exists(json_file) and stamp_matches(json_file, expected_stamp):
+        if os.path.exists(json_path) and stamp_matches(json_path, expected_stamp):
             continue
 
         stdout_buffer = io.StringIO()
@@ -872,7 +867,7 @@ def transcribe_audio(book_info):
         try:
             with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
                 result = transcribe_file(
-                    file,
+                    chunk_path,
                     model,
                     language,
                     backend,
@@ -888,8 +883,8 @@ def transcribe_audio(book_info):
 
         # Write the transcript atomically, then its stamp last, so an interrupted
         # write leaves neither a truncated transcript at the final path nor a stamp.
-        atomic_write_json_local(json_file, result)
-        write_compatibility_stamp(json_file, expected_stamp)
+        atomic_write_json_local(json_path, result)
+        write_compatibility_stamp(json_path, expected_stamp)
 
 
 
@@ -902,6 +897,7 @@ def link_html_with_audio(book_info):
     if not epub_path:
         print("ERROR: 'epub_file' not found in book_info.")
         return []
+    epub_path = resolve_book_path(book_info, epub_path)
     if not os.path.exists(epub_path):
         print(f"ERROR: EPUB file not found at path: {epub_path}")
         return []
@@ -1144,7 +1140,9 @@ def link_html_with_audio(book_info):
         transcript_basename(name, book_info["audio_extension"])
         for name in planned_chunk_basenames(book_info)
     ]
-    json_files = [name for name in json_files if os.path.exists(name)]
+    json_files = [
+        name for name in json_files if os.path.exists(resolve_book_path(book_info, name))
+    ]
     last_global_index = 0
     # Spine order of the most recently accepted match. Used as a hard forward-order
     # gate for the short-page fallback so a divider page can never be linked out of
@@ -1170,7 +1168,7 @@ def link_html_with_audio(book_info):
 
     for json_file in tqdm(json_files, desc="Matching transcripts", unit="file"):
         try:
-            audio_tokens = load_audio_tokens(json_file)
+            audio_tokens = load_audio_tokens(resolve_book_path(book_info, json_file))
             content_words = [item["word"] for item in audio_tokens]
 
             if not content_words or len(content_words) < 5:
@@ -1462,7 +1460,8 @@ def mark_segments(book_info):
         else "readaloud.css"
     )
 
-    with zipfile.ZipFile(book_info["out_file"], "r") as f:
+    working_epub = resolve_book_path(book_info, book_info["out_file"])
+    with zipfile.ZipFile(working_epub, "r") as f:
         reference_sets = _load_reference_sets(f, book_info)
         referenced_classes, referenced_ids = reference_sets or (None, None)
         processed_html_files = set()
@@ -1485,7 +1484,7 @@ def mark_segments(book_info):
             )
 
     if replacements:
-        replace_files_in_zip(book_info["out_file"], replacements)
+        replace_files_in_zip(working_epub, replacements)
 
 
 def get_clean_string(s):
@@ -3246,9 +3245,10 @@ def create_smil_files(book_info, skip=True):
     # Output model:
     # one HTML file -> one SMIL file, even when several audio chunks contribute to it.
     matched_items = sort_matched_items(book_info["matched_list"])
+    working_epub = resolve_book_path(book_info, book_info["out_file"])
     if not skip:
-        for file in glob.glob("*.smil"):
-            os.remove(file)
+        for file in iter_smil_files(book_info):
+            os.remove(resolve_book_path(book_info, file))
 
     alignment_stats = {
         "no_audio_tokens": 0,
@@ -3265,7 +3265,7 @@ def create_smil_files(book_info, skip=True):
         desc="Generating SMIL",
         unit="chunk",
     ):
-        audio_tokens = load_audio_tokens(json_file)
+        audio_tokens = load_audio_tokens(resolve_book_path(book_info, json_file))
         if not audio_tokens:
             alignment_stats["no_audio_tokens"] += 1
             continue
@@ -3280,7 +3280,7 @@ def create_smil_files(book_info, skip=True):
 
         for item in items:
             segments, html_tokens = load_html_segments_and_tokens(
-                book_info["out_file"], item["html_file"]
+                working_epub, item["html_file"]
             )
             if not html_tokens:
                 alignment_stats["no_segments"] += 1
@@ -3435,10 +3435,11 @@ def create_smil_files(book_info, skip=True):
 
     for html_file in tqdm(matched_html_files, desc="Writing SMIL", unit="file"):
         smil_filename = make_overlay_basename(html_file)
-        if os.path.exists(smil_filename) and skip:
+        smil_path = resolve_book_path(book_info, smil_filename)
+        if os.path.exists(smil_path) and skip:
             continue
 
-        segments, _html_tokens = load_html_segments_and_tokens(book_info["out_file"], html_file)
+        segments, _html_tokens = load_html_segments_and_tokens(working_epub, html_file)
         aggregated_matches = aggregated_matches_by_html.get(html_file, {})
 
         # Build the grouped SMIL shell for this one HTML file.
@@ -3494,7 +3495,7 @@ def create_smil_files(book_info, skip=True):
                     seq.append(par)
 
         # Write SMIL
-        with open(smil_filename, "w", encoding="utf-8") as f:
+        with open(smil_path, "w", encoding="utf-8") as f:
             f.write(convert_soup_to_html(soup_smil))
 
     print_nonzero_summary(
@@ -3520,14 +3521,19 @@ def merge_files(book_info):
         else "readaloud.css"
     )
 
-    with zipfile.ZipFile(book_info["out_file"], "a") as f:
+    with zipfile.ZipFile(resolve_book_path(book_info, book_info["out_file"]), "a") as f:
         # Package exactly the planned chunks, never the copied source audiobook or a
         # stale chunk from an older plan.
         for file in planned_chunk_basenames(book_info):
-            f.write(file, f"audio/{file}")
+            f.write(resolve_book_path(book_info, file), f"audio/{file}")
 
-        for file in sorted(glob.glob("*.smil")):
-            f.write(file, f"smil/{file}")
+        # Package exactly the overlays the OPF rewrite will declare: one per matched
+        # HTML file (create_smil_files writes every one of them).
+        html_files = dict.fromkeys(
+            item["html_file"] for item in normalize_matched_list(book_info["matched_list"])
+        )
+        for file in (make_overlay_basename(html_file) for html_file in html_files):
+            f.write(resolve_book_path(book_info, file), f"smil/{file}")
 
         css_content = """\
             .-epub-media-overlay-active {
@@ -3537,17 +3543,19 @@ def merge_files(book_info):
         f.writestr(css_zip_path, css_content)
 
 
-def post_processing_opf(book_info):
+def post_processing_opf(book_info, output_epub_path):
     # OPF rewrite responsibilities:
     # - declare packaged audio assets
     # - declare one overlay SMIL per matched HTML file
     # - write per-overlay and total media durations
     # - attach `media-overlay` references to HTML manifest items
     # - synthesize a nav document if the source package lacks one
+    # - move the finished working `.epub3` to `output_epub_path`
     matched_items = normalize_matched_list(book_info["matched_list"])
     replacements = {}
+    working_epub = resolve_book_path(book_info, book_info["out_file"])
 
-    with zipfile.ZipFile(book_info["out_file"], "r") as f:
+    with zipfile.ZipFile(working_epub, "r") as f:
         for file_name in f.namelist():
             if ".opf" in file_name:
                 break
@@ -3651,7 +3659,7 @@ def post_processing_opf(book_info):
             )
             manifest.append(item)
 
-            smil_duration = get_smil_duration(file_name)
+            smil_duration = get_smil_duration(resolve_book_path(book_info, file_name))
             total_duration += smil_duration
 
             duration_meta = soup.new_tag(
@@ -3694,8 +3702,7 @@ def post_processing_opf(book_info):
                 el["media-overlay"] = make_overlay_id(html_file)
 
     replacements[opf_file] = convert_soup_to_html(soup)
-    replace_files_in_zip(book_info["out_file"], replacements)
-    # Move the working `.epub3` to the final `.epub` output path.
-    shutil.move(
-        book_info["out_file"], "../" + book_info["out_file"].replace(".epub3", ".epub")
-    )
+    replace_files_in_zip(working_epub, replacements)
+    # The packaged working copy becomes the output; the caller decides where.
+    os.makedirs(os.path.dirname(os.path.abspath(str(output_epub_path))), exist_ok=True)
+    shutil.move(working_epub, str(output_epub_path))

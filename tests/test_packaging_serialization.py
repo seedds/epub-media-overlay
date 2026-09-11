@@ -136,3 +136,98 @@ def test_get_audio_duration_uses_fallback_when_available():
     )
     assert result == 13.0
 
+
+
+# --- folder-addressed engine (no cwd dependence) ----------------------------
+
+_OPF_WITH_NAV = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="u">'
+    '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>T</dc:title></metadata>'
+    "<manifest>"
+    '<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>'
+    '<item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/>'
+    '</manifest><spine><itemref idref="c1"/></spine></package>'
+)
+
+
+def _write_working_epub(path):
+    import zipfile
+
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("OEBPS/content.opf", _OPF_WITH_NAV)
+        zf.writestr("OEBPS/nav.xhtml", "<html><body><nav/></body></html>")
+        zf.writestr("OEBPS/ch1.xhtml", "<html><body><p>Hello there.</p></body></html>")
+
+
+def test_preprocess_uses_book_folder_not_cwd(tmp_path, monkeypatch):
+    folder = tmp_path / "run"
+    folder.mkdir()
+    source = tmp_path / "Book.epub"
+    _write_working_epub(source)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    book_info = {"folder_name": str(folder), "audio_file": "Book.m4b"}
+    audio_file, epub_file, out_file = pc.preprocess(book_info, source)
+
+    assert (audio_file, epub_file, out_file) == ("Book.m4b", "Book.epub", "Book.epub3")
+    assert (folder / "Book.epub3").exists()
+    assert not list(elsewhere.iterdir())
+    assert book_info["opf_file"] == "OEBPS/content.opf"
+    assert book_info["opf_dir"] == "OEBPS"
+
+
+def test_merge_and_opf_rewrite_package_to_explicit_path(tmp_path, monkeypatch):
+    import zipfile
+
+    from bs4 import BeautifulSoup
+
+    folder = tmp_path / "run"
+    folder.mkdir()
+    _write_working_epub(folder / "Book.epub3")
+    (folder / "000.m4a").write_bytes(b"\x00\x01")
+    (folder / "Book.m4b").write_bytes(b"\x00")  # copied source: must not be packaged
+    smil_name = pc.make_overlay_basename("OEBPS/ch1.xhtml")
+    (folder / smil_name).write_text(
+        '<smil xmlns="http://www.w3.org/ns/SMIL" version="3.0"><body><seq>'
+        '<par id="s1"><text src="../OEBPS/ch1.xhtml#s1"/>'
+        '<audio src="../audio/000.m4a" clipBegin="0.000s" clipEnd="2.500s"/></par>'
+        "</seq></body></smil>",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        pc, "plan_audio_chunks",
+        lambda book_info, audio_path=None: [
+            {"id": 0, "start_time": "0", "end_time": "2.5", "output_name": "000.m4a"}
+        ],
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    book_info = {
+        "folder_name": str(folder),
+        "audio_file": "Book.m4b",
+        "out_file": "Book.epub3",
+        "opf_dir": "OEBPS",
+        "audio_extension": ".m4a",
+        "matched_list": [{"json_file": "000.json", "html_file": "OEBPS/ch1.xhtml"}],
+    }
+    dest = tmp_path / "out" / "Book.epub"
+    pc.merge_files(book_info)
+    pc.post_processing_opf(book_info, dest)
+
+    assert dest.exists()
+    assert not (folder / "Book.epub3").exists()
+    assert not list(elsewhere.iterdir())
+    with zipfile.ZipFile(dest) as zf:
+        names = set(zf.namelist())
+        opf = BeautifulSoup(zf.read("OEBPS/content.opf"), "lxml-xml")
+    assert {"audio/000.m4a", f"smil/{smil_name}", "OEBPS/readaloud.css"} <= names
+    assert "audio/Book.m4b" not in names
+    html_item = opf.find("item", attrs={"href": "ch1.xhtml"})
+    assert html_item["media-overlay"] == pc.make_overlay_id("OEBPS/ch1.xhtml")
+    durations = [m.get_text() for m in opf.find_all("meta", attrs={"property": "media:duration"})]
+    assert durations == ["0:00:02.500", "0:00:02.500"]

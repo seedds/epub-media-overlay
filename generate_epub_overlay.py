@@ -21,7 +21,6 @@ import sys
 import time
 import traceback
 import zipfile
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -285,16 +284,6 @@ def configure_logging(paths: RuntimePaths) -> logging.Logger:
     logger.addHandler(file_handler)
 
     return logger
-
-
-@contextmanager
-def pushd(path: Path):
-    previous = Path.cwd()
-    os.chdir(path)
-    try:
-        yield
-    finally:
-        os.chdir(previous)
 
 
 def parse_args() -> PipelineConfig:
@@ -670,7 +659,7 @@ def build_book_info(state: dict[str, Any], paths: RuntimePaths, matched_list: li
     return book_info
 
 
-def refresh_working_epub(legacy: Any, book_info: dict[str, Any], run_dir: Path) -> dict[str, Any]:
+def refresh_working_epub(legacy: Any, book_info: dict[str, Any], run_dir: Path, source_epub: Path) -> dict[str, Any]:
     refreshed = {
         "folder_name": str(run_dir),
         "audio_file": book_info["audio_file"],
@@ -686,30 +675,20 @@ def refresh_working_epub(legacy: Any, book_info: dict[str, Any], run_dir: Path) 
         "model": book_info.get("model"),
         "language": book_info.get("language", "en"),
     }
-    with pushd(run_dir):
-        audio_file, _source_epub, out_file, root_level = legacy.preprocess(refreshed)
-    refreshed.update(
-        {
-            "audio_file": audio_file,
-            "epub_file": out_file,
-            "out_file": out_file,
-            "root_level": root_level,
-        }
-    )
+    audio_file, _source_epub, out_file = legacy.preprocess(refreshed, source_epub)
+    refreshed.update({"audio_file": audio_file, "epub_file": out_file, "out_file": out_file})
     return refreshed
 
 
-def inspect_working_epub(working_epub_path: Path) -> tuple[str, int] | None:
+def inspect_working_epub(working_epub_path: Path) -> str | None:
+    """Return the OPF path inside the working EPUB, or None if it is unusable."""
     if not working_epub_path.exists():
         return None
     try:
         with zipfile.ZipFile(working_epub_path, "r") as zf:
-            opf_file = next((name for name in zf.namelist() if name.endswith(".opf")), None)
+            return next((name for name in zf.namelist() if name.endswith(".opf")), None)
     except (OSError, zipfile.BadZipFile):
         return None
-    if not opf_file:
-        return None
-    return opf_file, len(list(Path(opf_file).parents))
 
 
 def build_prepared_book_info_from_artifacts(
@@ -719,11 +698,10 @@ def build_prepared_book_info_from_artifacts(
     copied_audio = paths.run_dir / config.audio.name
     copied_epub = paths.run_dir / config.epub.name
     working_epub = paths.run_dir / config.epub.with_suffix(".epub3").name
-    opf_details = inspect_working_epub(working_epub)
-    if not copied_audio.exists() or not copied_epub.exists() or opf_details is None:
+    opf_file = inspect_working_epub(working_epub)
+    if not copied_audio.exists() or not copied_epub.exists() or opf_file is None:
         return None
 
-    opf_file, root_level = opf_details
     opf_dir = str(Path(opf_file).parent)
     return {
         "folder_name": str(paths.run_dir),
@@ -743,7 +721,6 @@ def build_prepared_book_info_from_artifacts(
         "out_file": working_epub.name,
         "opf_file": opf_file,
         "opf_dir": opf_dir,
-        "root_level": root_level,
     }
 
 
@@ -775,10 +752,6 @@ def expected_audio_files(legacy: Any, book_info: dict[str, Any], run_dir: Path) 
     chunk_plan = legacy.plan_audio_chunks(book_info, run_dir / book_info["audio_file"])
     names = [chunk["output_name"] for chunk in chunk_plan]
     return names, chunk_plan
-
-
-def list_transcripts(run_dir: Path) -> list[str]:
-    return sorted(path.name for path in run_dir.glob("*.json"))
 
 
 def load_matched_list(paths: RuntimePaths) -> list[dict[str, Any]]:
@@ -1047,16 +1020,8 @@ def run_prepare_stage(
         "model": config.model,
         "language": config.language,
     }
-    with pushd(paths.run_dir):
-        audio_file, _epub_file, out_file, root_level = legacy.preprocess(book_info)
-    book_info.update(
-        {
-            "audio_file": audio_file,
-            "epub_file": out_file,
-            "out_file": out_file,
-            "root_level": root_level,
-        }
-    )
+    audio_file, _epub_file, out_file = legacy.preprocess(book_info, copied_epub)
+    book_info.update({"audio_file": audio_file, "epub_file": out_file, "out_file": out_file})
 
     state["book_info"] = book_info
     state["artifacts"]["prepared_epub"] = str(paths.run_dir / out_file)
@@ -1076,8 +1041,7 @@ def run_split_stage(
 ) -> dict[str, Any]:
     book_info = build_book_info(state, paths)
     audio_files, chunks = expected_audio_files(legacy, book_info, paths.run_dir)
-    with pushd(paths.run_dir):
-        split_stats = legacy.split_audio(book_info)
+    split_stats = legacy.split_audio(book_info)
     invalid = [chunk["output_name"] for chunk in chunks if not legacy.is_audio_chunk_complete(book_info, chunk)]
     if invalid:
         raise RuntimeError(f"Audio split stage did not produce all expected valid chunks: {invalid}")
@@ -1121,12 +1085,11 @@ def run_transcribe_stage(
     if applied_cache_gb is not None:
         logger.info("mlx Metal cache limit set to %.1f GB", applied_cache_gb)
 
-    with pushd(paths.run_dir):
-        legacy.transcribe_audio(book_info)
+    legacy.transcribe_audio(book_info)
 
-    audio_files = state.get("artifacts", {}).get("audio_files") or sorted(
-        path.name for path in paths.run_dir.glob(f"*{config.audio_extension}")
-    )
+    audio_files = state.get("artifacts", {}).get("audio_files")
+    if not audio_files:
+        audio_files, _chunks = expected_audio_files(legacy, book_info, paths.run_dir)
     transcript_files = [Path(name).with_suffix(".json").name for name in audio_files]
     missing = [name for name in transcript_files if not (paths.run_dir / name).exists()]
     if missing:
@@ -1143,8 +1106,7 @@ def run_match_stage(
     logger: logging.Logger,
 ) -> dict[str, Any]:
     book_info = build_book_info(state, paths)
-    with pushd(paths.run_dir):
-        matched_list = legacy.link_html_with_audio(book_info)
+    matched_list = legacy.link_html_with_audio(book_info)
     if not matched_list:
         raise RuntimeError("Matching stage produced an empty matched list")
     atomic_write_json(paths.matched_list_path, matched_list)
@@ -1157,6 +1119,7 @@ def run_match_stage(
 
 
 def run_segment_stage(
+    config: PipelineConfig,
     paths: RuntimePaths,
     state: dict[str, Any],
     legacy: Any,
@@ -1178,12 +1141,16 @@ def run_segment_stage(
         logger.info("Recovered segmented EPUB snapshot from existing working EPUB")
         return {"html_files": html_files, "snapshot": str(paths.segmented_snapshot_path)}
 
-    book_info = refresh_working_epub(legacy, build_book_info(state, paths, matched_list), paths.run_dir)
+    book_info = refresh_working_epub(
+        legacy,
+        build_book_info(state, paths, matched_list),
+        paths.run_dir,
+        paths.run_dir / config.epub.name,
+    )
     book_info["matched_list"] = matched_list
     state["book_info"] = {k: v for k, v in book_info.items() if k != "matched_list"}
 
-    with pushd(paths.run_dir):
-        legacy.mark_segments(book_info)
+    legacy.mark_segments(book_info)
 
     if not epub_contains_segment_ids(working_epub_path, html_files):
         raise RuntimeError("Segmented working EPUB did not contain the expected segment IDs")
@@ -1207,8 +1174,7 @@ def run_smil_stage(
         restore_segmented_working_epub(state, paths)
 
     book_info = build_book_info(state, paths, matched_list)
-    with pushd(paths.run_dir):
-        legacy.create_smil_files(book_info, skip=True)
+    legacy.create_smil_files(book_info, skip=True)
 
     missing = [name for name in expected_files if not (paths.run_dir / name).exists()]
     if missing:
@@ -1229,9 +1195,8 @@ def run_package_stage(
     delete_path(paths.packaged_epub_path)
 
     book_info = build_book_info(state, paths, matched_list)
-    with pushd(paths.run_dir):
-        legacy.merge_files(book_info)
-        legacy.post_processing_opf(book_info)
+    legacy.merge_files(book_info)
+    legacy.post_processing_opf(book_info, paths.packaged_epub_path)
 
     if not paths.packaged_epub_path.exists():
         raise RuntimeError(f"Packaged EPUB not found after packaging stage: {paths.packaged_epub_path}")
@@ -1281,7 +1246,7 @@ def execute_stage(
     if stage == "match":
         return run_match_stage(paths, state, legacy, logger)
     if stage == "segment":
-        return run_segment_stage(paths, state, legacy, logger)
+        return run_segment_stage(config, paths, state, legacy, logger)
     if stage == "smil":
         return run_smil_stage(paths, state, legacy, logger)
     if stage == "package":
