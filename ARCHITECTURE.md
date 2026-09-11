@@ -14,15 +14,17 @@ ordered stages: **prepare → split → transcribe → match → segment → smi
 package → validate**.
 
 `generate_epub_overlay.py` is the CLI entry point and orchestrator. It imports
-`pipeline_core.py` (the core engine, referenced internally as the `legacy`
-object) and drives its functions as discrete stages. The source `.epub` is never
-modified in place.
+`pipeline_core.py` (the core engine) and drives its functions as discrete stages.
+The source `.epub` is never modified in place.
 
 Two pieces of shared context recur everywhere:
 
 - **`book_info`** — a mutable dict threaded through every engine call. It carries
   discovered paths, the working-EPUB location, OPF metadata, and the
-  backend/model/audio settings for the run.
+  backend/model/audio settings for the run. It is built in one place
+  (`book_info_from_config`) and every file name in it is a basename that the engine
+  resolves against `folder_name` (`resolve_book_path`); nothing depends on the
+  process working directory.
 - **`state.json`** — per-stage status plus a signature of the inputs/config,
   persisted after every stage so an interrupted run resumes automatically.
 
@@ -65,11 +67,21 @@ This is the backbone of the orchestrator and the part most worth understanding.
   if they differ, the inputs/config changed.
 
 - **Reset preserves expensive work.** When the signature no longer matches, the
-  *derived downstream* artifacts (`matched_list.json`, `segmented.epub3`,
-  `validation.json`, packaged EPUB, loose SMIL files) are deleted, but the audio
-  chunks and transcripts in `run/` are **never** thrown away automatically.
-  Transcription is slow and non-deterministic, so it is only redone when the
-  inputs actually change in a way that invalidates it (or the user forces it).
+  *derived downstream* artifacts are deleted: `matched_list.json`,
+  `segmented.epub3`, the working `run/<stem>.epub3` (it carries segment ids),
+  `run/*.smil`, `validation.json`, the packaged `<work>/<stem>.epub` **and the
+  final output EPUB**. Only these known paths are removed, never a wildcard over
+  the work-dir root (which may hold unrelated EPUBs). The audio chunks and
+  transcripts in `run/` are **never** thrown away by a reset; their compatibility
+  stamps decide reuse per artifact. Transcription is slow and non-deterministic,
+  so it is only redone when the inputs actually change in a way that invalidates it.
+
+- **Downstream invalidation.** Whenever a stage actually *executes* (as opposed to
+  being skipped), the derived artifacts of every later stage are deleted and those
+  stages reset to pending. A re-run match therefore always leads to a re-run
+  segment/smil/package/validate; a packaged EPUB can never be reused against a
+  newer SMIL set. `prepare` is exempt (it re-runs after every completed run because
+  packaging moves the working EPUB away, without changing any input).
 
 - **Per-stage reconciliation is the real resume engine.** On every run, before
   running a stage, the orchestrator re-validates that stage's on-disk artifacts
@@ -78,15 +90,23 @@ This is the backbone of the orchestrator and the part most worth understanding.
   not the source of truth — reconciliation can recover correct behavior even
   when the recorded status is stale or the file was edited. Some non-obvious
   reconciliation behavior:
-  - `split` is considered done only if every planned chunk file exists **and**
-    passes the duration-completeness check (see below).
-  - `match` is invalidated if the set of transcript files referenced by
-    `matched_list.json` no longer equals the actual transcript files on disk.
+  - `split` is considered done only if every planned chunk file exists, carries a
+    matching compatibility stamp **and** passes the duration-completeness check
+    (see below). Reconcile (like the stage itself) also prunes `NNN.*` chunk,
+    transcript and stamp files whose ordinal is outside the current plan.
+  - `match` records the list of transcripts it ran over
+    (`artifacts.match_transcript_files`); it is reusable only while that list
+    equals the current transcript set and every matched transcript is in it. Some
+    transcripts legitimately match nothing (intro/outro chunks), so "every
+    transcript appears in the matched list" is deliberately *not* the test.
   - `segment` keeps the working EPUB and the `segmented.epub3` snapshot in sync:
     whichever one already has segment ids is copied to the other.
-  - `package` accepts either the final output EPUB or the working packaged EPUB,
-    verifies it actually contains every expected `audio/` and `smil/` entry, and
-    backfills the missing copy from the present one.
+  - `package` accepts the final output EPUB or the working packaged EPUB only if
+    it is byte-identical (size + SHA-256) to the package this state recorded and
+    contains every expected `audio/` and `smil/` entry; the missing copy is
+    backfilled from the present one. A processed EPUB with the right entry names
+    but no record (e.g. after a reset) is not enough.
+  - `validate` is bound the same way to the packaged EPUB it validated.
 
 - **Atomic writes.** `state.json` and other JSON/text artifacts are written via a
   temp-file-then-rename so an interrupted write can't corrupt them.
@@ -123,7 +143,15 @@ non-obvious decisions — the things that look wrong until you know why.
   chunks (`--chunk-seconds`, default 600s) when there are no usable chapters.
   Chapter boundaries are used only to get manageable audio segments — they are
   **not** trusted as reading order. Final text correspondence is decided later in
-  the match stage.
+  the match stage. The first chunk is snapped to 0 and the last to the audio
+  stream's end when the markers leave more than half a second out, so no audio
+  outside the chapter markers is silently dropped.
+- **The plan is the only source of chunk names.** Every later stage (transcribe,
+  match, package, OPF rewrite) takes its chunk/transcript list from
+  `planned_chunk_basenames`, never from a directory glob, and split prunes
+  `NNN.*` files whose ordinal is not in the plan. Otherwise chunks left by an
+  older plan (new audio, different `--chunk-seconds`) were re-transcribed,
+  matched, packaged and declared in the OPF.
 - **Too-short chunks are merged forward.** A chapter shorter than ~10s is folded
   into a neighbor. The reason is concrete: a few-second header chunk can fall
   entirely inside one AAC keyframe interval, so `ffmpeg` stream-copy has no clean
@@ -146,7 +174,12 @@ non-obvious decisions — the things that look wrong until you know why.
 
 - Transcribes each **split chunk**, not the original audiobook, writing a sibling
   `.json` per chunk; those JSONs are the canonical transcript artifacts for both
-  matching and alignment. Existing JSONs are skipped (idempotent/resumable).
+  matching and alignment. A transcript is reused only when its `.meta` stamp
+  matches the current backend/model/language and its parent chunk's stamp
+  (idempotent/resumable).
+- Models are loaded once per run and released after the stage
+  (`transcription_backend.release_models`); whisperx used to reload its ASR and
+  alignment models for every chunk.
 - Backend output is suppressed (stdout/stderr redirected) because WhisperX is
   noisy, but on failure the captured output is re-raised in the error so the real
   cause survives.
@@ -171,7 +204,14 @@ line up one-to-one.
   headers are noisy, so matching stays lexical: a cheap multiset token-overlap
   count prefilters and ranks candidates, then the top handful are rescored with a
   `difflib` sequence ratio over just the probe-length prefix. The final score
-  blends overlap, sequence ratio, and a small forward-order bonus.
+  blends overlap, sequence ratio, and a small forward-order bonus
+  (`score_probe_candidates`; thresholds are the `MATCH_*` constants).
+- **One alignment routine.** Estimating how far into a transcript a file reaches
+  (matching) and timing segments (SMIL) both call `align_tokens`, which runs
+  `difflib` over progressively widening HTML ranges (`alignment_search_ranges`)
+  and stops once enough tokens match.
+- **Failures are loud.** A transcript that cannot be parsed or matched raises with
+  the file name; silently counting it would drop that chapter from the overlay.
 - **Forward bias is soft in the main path.** Being in reading order only earns a
   small bonus; a slightly out-of-order but strongly matching window can still
   win, and backward jumps are merely logged (intro/preface files are exempt).
@@ -182,9 +222,9 @@ line up one-to-one.
   A deliberate backtrack (~24 tokens) rewinds the cursor so the next span
   re-checks an overlap region instead of dropping boundary words; each span's
   audio-end is back-filled from the next span's start so spans don't overlap.
-- **Short-page / divider-page fallback.** Tiny divider/heading pages (e.g. "PART
-  6 / THE GREEN CARD MAN") can't clear the normal thresholds, so they get a
-  dedicated path. A short page is accepted only if it (a) is genuinely a
+- **Short-page / divider-page fallback** (`select_short_page_match`). Tiny
+  divider/heading pages (e.g. "PART 6 / THE GREEN CARD MAN") can't clear the
+  normal thresholds, so they get a dedicated path. A short page is accepted only if it (a) is genuinely a
   short-page candidate, (b) does **not** move backward in spine order (here the
   forward gate is *hard*, unlike the soft main path), and (c) its tokens appear
   as a contiguous run at the probe start. That prefix check tolerates 1–2 stray
@@ -204,7 +244,16 @@ agree on what a "token" is.
 
 - `mark_segments` injects stable segment-span ids into each matched HTML file
   **exactly once** (even if several chunks map to that chapter) and attaches the
-  read-aloud CSS, writing into both the working EPUB and a loose copy.
+  read-aloud CSS, writing into the working EPUB.
+- **Redundant-markup cleanup is evidence-based and fail-closed.** Before
+  segmenting, unreferenced `class`/`id` values, now-bare `<span>`s and empty
+  inline leftovers are removed using the whole-EPUB reference index (see
+  `epub_reference_index.py`). The index sets are treated as *complete*, so an
+  empty set means "strip everything"; when the index cannot be built the cleanup
+  is skipped entirely (`None` sets) rather than run with empty ones. Whitespace-only
+  inline tags are unwrapped, not deleted, so `foo<i> </i>bar` keeps its space;
+  empty block tags (visible spacers) and positional tags (`<td>`, `<li>`) are never
+  removed.
 - **Why not just `get_text()`?** Naive "flatten text → segment → reinject"
   flattens inline markup, drops empty anchors, drifts/loses void tags, and
   changes whitespace across parse/serialize cycles. `mark_sentence.py` instead
@@ -221,8 +270,9 @@ agree on what a "token" is.
     zero-width nodes at their exact offsets, groups contiguous same-format runs
     into single text nodes (no per-character "span soup"), and avoids
     whitespace-only wrapper tags that serialize inconsistently.
-  - A final consistency check verifies the visible text is byte-for-byte
-    unchanged.
+  - The document is parsed once; its visible text is captured *before* cleanup and
+    compared with the final DOM, so a cleanup pass that altered text is caught,
+    not only a segmentation error.
 - NLTK tokenizer data is bootstrapped on first run and cached under
   `~/.cache/epub-media-overlay/nltk_data`. See
   [`docs/sentence_segmentation.md`](docs/sentence_segmentation.md) for the
@@ -231,7 +281,10 @@ agree on what a "token" is.
 ### SMIL alignment (`create_smil_files`)
 
 - **One SMIL per HTML file**, even when several audio chunks contribute; matches
-  are aggregated per file and de-duplicated by segment id.
+  are aggregated per file and de-duplicated by segment id. Every SMIL is
+  regenerated on each run of the stage (seam resolution works across files, so a
+  leftover from an interrupted run would be inconsistent with its neighbours);
+  skipping the stage when its outputs are complete is the orchestrator's job.
 - Each chunk's transcript words are aligned to that file's segment-aware HTML
   tokens with `difflib` over a hinted, progressively-widening search range,
   stopping early once enough tokens match.
@@ -244,11 +297,13 @@ agree on what a "token" is.
   never for leading/trailing gaps. Non-positive gaps (common right before an
   ellipsis, where punctuation-only spans produce non-monotonic envelopes) are
   skipped to avoid overlapping clips.
-- **Anchoring.** The first segment's start is pinned to 0.0 and the last
+- **Anchoring.** Segment starts are first clamped to be non-decreasing (a
+  non-monotonic envelope would otherwise yield a dropped `<par>` and overlapping
+  neighbours), then the first segment's start is pinned to 0.0 and the last
   segment's end to the audio's measured duration, and inter-segment gaps are
   closed by snapping each end to the next start, so the overlay fully covers the
   chunk's audio with no holes. Clip times are emitted as 3-decimal SMIL clock
-  values, and a `<par>` is written only when `end > start`.
+  values, and a `<par>` is written only when `end > start` (`write_smil_file`).
 
 ### Packaging & OPF rewrite (`post_processing_opf`)
 
@@ -263,15 +318,20 @@ agree on what a "token" is.
   audio files; a package-level total is also written.
 - If the source has no XHTML `nav`, one is **synthesized from the NCX** and added
   to the manifest.
-- **Gotcha:** the final step moves the working `.epub3` up one directory and
-  renames it to `.epub`. The "real" packaged output is therefore *not* the file
-  sitting inside the book folder — validation has to go find the processed
-  package.
+- **Gotcha:** the final step moves the working `.epub3` to the destination the
+  orchestrator passes in (`<work_dir>/<stem>.epub`), which is then copied to the
+  final output path. The "real" packaged output is therefore *not* a file inside
+  `run/` — validation has to go find the processed package.
+- The OPF is located through `find_opf_path` (META-INF/container.xml first, then
+  the first `*.opf` entry); every other OPF lookup in the codebase uses the same
+  helper.
 
 ### Validation (`run_post_checks`)
 
-- **Read-only / audit-only.** Every check inspects existing artifacts and reports
-  pass / skip / findings; nothing is generated or repaired.
+- **Read-only / audit-only.** Every `check_*` function inspects existing artifacts
+  and reports pass / skip / findings; nothing is generated or repaired. The audio
+  inventory (one `ffprobe` per chunk, transcript status, word count) and the SMIL
+  clip parse are computed once and shared by all checks.
 - **Mixes pre- and post-package checks** so the same runner works at different
   points: loose-artifact checks and packaged-EPUB checks coexist, and each one
   *skips* (counts as pass) when its inputs aren't present yet. The packaged-side
@@ -290,18 +350,19 @@ agree on what a "token" is.
 Isolates ASR engine choice so the rest of the pipeline is engine-agnostic.
 
 - Auto-detects the backend: **mlx** on Apple Silicon, **whisperx** elsewhere
-  (overridable via `--backend`).
+  (overridable via `--backend`). `BACKENDS`, `DEFAULT_MODEL_BY_BACKEND` and
+  `REQUIRED_MODULE_BY_BACKEND` are the only tables.
 - Exposes a single `transcribe_file` that dispatches to the mlx or whisperx
-  adapter, plus helpers for the default model per backend and the required import
-  module.
+  adapter. whisperx ASR and alignment models are cached per (model, device,
+  compute type) / (language, device) for the run and dropped by `release_models`.
 - `apply_mlx_cache_limit` optionally caps the mlx Metal buffer cache during
   transcription, so freed GPU/unified memory isn't retained unbounded across
   chunks (controlled by `--mlx-cache-gb`; a no-op on non-mlx backends).
 
 ## Module-level environment & config
 
-Set at import time in `pipeline_core.py` because they must take effect before the
-ASR/ML libraries load:
+Set at import time in `transcription_backend.py` because they must take effect
+before the ASR/ML libraries load (which happens lazily in that module):
 
 - `TOKENIZERS_PARALLELISM=false` — avoid HuggingFace fork-parallelism
   warnings/deadlocks (the pipeline does its own threading).
@@ -323,10 +384,16 @@ name).
 
 | File | Covers |
 | --- | --- |
-| `tests/test_alignment.py` | Token splitting (hyphens, apostrophes, unicode dashes, abbreviations), segment alignment and interior gap interpolation, overlap avoidance, short-page / page-prefix matching |
+| `tests/test_alignment.py` | Token splitting, `align_tokens`, segment alignment and interior gap interpolation, overlap avoidance, monotonic clamp, short-page matching, seam resolution, coverage-gap and unmatched-spine checks |
 | `tests/test_segmentation.py` | Sentence/phrase boundary detection (`mark_sentence`), as parametrized `(text, expected_segments)` cases |
+| `tests/test_mark_sentences_inline.py` | `mark_sentences` round-trips: inline tags survive, reference-index semantics (None skips cleanup), text integrity, anchor placement, CSS link |
 | `tests/test_html_cleaner.py` | `preprocess_remove_redundant_tags`: unreferenced class/id stripping, bare-span unwrap, empty-tag removal, safety controls |
-| `tests/test_epub_reference_index.py` | `epub_reference_index`: CSS/link/JS reference extraction; optional integration test against a real EPUB |
+| `tests/test_epub_reference_index.py` | `epub_reference_index`: CSS (incl. `:not()`/`:is()` arguments, `@media`), link/NCX/OPF-guide fragments, JS tokens; optional integration test against a real EPUB |
+| `tests/test_compat_stamps.py` | Chunk/transcript compatibility stamps and atomic JSON writes |
+| `tests/test_split_plan.py` | Chunk planning (edge snapping) and stale-chunk pruning |
+| `tests/test_packaging_serialization.py` | OPF serialization, media types, `find_opf_path`, folder-addressed `preprocess`/`merge_files`/`post_processing_opf`, validation inventory |
+| `tests/test_orchestrator_state.py` | Reset scope, downstream invalidation, package/match/split reconcile rules |
+| `tests/test_transcription_backend.py` | whisperx model caching and release |
 
 Run the whole suite:
 

@@ -244,6 +244,7 @@ The `--language` setting is used for both transcription and HTML sentence segmen
 ### Run behavior
 
 - if compatible work already exists, the pipeline resumes automatically
+- if the inputs or transcription-relevant options changed, derived artifacts (match, segmentation, SMIL, packaged and final EPUB) are rebuilt; split audio chunks and transcripts are kept and reused whenever their recorded configuration still matches
 - if no work exists yet, the pipeline starts from the beginning
 - if `--output-dir` is omitted, the final EPUB is written next to the source EPUB
 
