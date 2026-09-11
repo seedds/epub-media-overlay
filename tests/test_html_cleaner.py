@@ -11,20 +11,8 @@ fire:
   - never touch elements carrying inline style=
 
 Run:
-  /Users/f2pgod/Documents/spyder312/bin/python -m pytest tests/test_html_cleaner.py -q
-or:
-  /Users/f2pgod/Documents/spyder312/bin/python tests/test_html_cleaner.py
+  pytest tests/test_html_cleaner.py -q
 """
-
-# Bootstrap: allow running this file directly (`python tests/test_html_cleaner.py`).
-# Source modules are imported by bare name below, so the repo root must be on
-# sys.path before those imports. Under pytest, pyproject's pythonpath handles this.
-import sys as _sys
-from pathlib import Path as _Path
-
-_ROOT = str(_Path(__file__).resolve().parent.parent)
-if _ROOT not in _sys.path:
-    _sys.path.insert(0, _ROOT)
 
 from bs4 import BeautifulSoup
 
@@ -191,8 +179,3 @@ def test_visible_text_is_unchanged():
     )
     assert before == after == "Hello world"
 
-
-if __name__ == "__main__":
-    from _runner import run_module_tests
-
-    raise SystemExit(run_module_tests(globals()))

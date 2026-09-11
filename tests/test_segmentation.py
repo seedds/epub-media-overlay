@@ -11,20 +11,8 @@ These previously lived in `mark_sentence.py`'s `__main__` block as manual
 individually under pytest.
 
 Run:
-  /Users/f2pgod/Documents/spyder312/bin/python -m pytest tests/test_segmentation.py -q
-or:
-  /Users/f2pgod/Documents/spyder312/bin/python tests/test_segmentation.py
+  pytest tests/test_segmentation.py -q
 """
-
-# Bootstrap: allow running this file directly (`python tests/test_segmentation.py`).
-# Source modules are imported by bare name below, so the repo root must be on
-# sys.path before those imports. Under pytest, pyproject's pythonpath handles this.
-import sys as _sys
-from pathlib import Path as _Path
-
-_ROOT = str(_Path(__file__).resolve().parent.parent)
-if _ROOT not in _sys.path:
-    _sys.path.insert(0, _ROOT)
 
 import pytest
 
@@ -295,19 +283,3 @@ def _segments(text: str) -> list[str]:
 def test_segmentation(text, expected):
     assert _segments(text) == expected
 
-
-if __name__ == "__main__":
-    # No-pytest fallback: parametrized cases can't be called arg-less, so iterate
-    # CASES directly. Mirrors tests/_runner.py's PASS/FAIL reporting.
-    failures = []
-    for text, expected in CASES:
-        label = repr(text)
-        try:
-            got = _segments(text)
-            assert got == expected, f"expected {expected!r}, got {got!r}"
-            print(f"✅ {label}")
-        except AssertionError as exc:
-            failures.append((label, exc))
-            print(f"❌ {label}: {exc}")
-    print(f"\n{len(CASES) - len(failures)}/{len(CASES)} passed")
-    raise SystemExit(1 if failures else 0)

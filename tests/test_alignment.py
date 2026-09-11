@@ -14,20 +14,8 @@ the hyphenated HTML word ("dry-swallowed") did not match the two ASR words
 ("dry", "swallowed"), so its segment was dropped from the SMIL.
 
 Run:
-  /Users/f2pgod/Documents/spyder312/bin/python -m pytest tests/test_alignment.py -q
-or:
-  /Users/f2pgod/Documents/spyder312/bin/python tests/test_alignment.py
+  pytest tests/test_alignment.py -q
 """
-
-# Bootstrap: allow running this file directly.
-# Source modules are imported by bare name below, so the repo root must be on
-# sys.path before those imports. Under pytest, pyproject's pythonpath handles this.
-import sys as _sys
-from pathlib import Path as _Path
-
-_ROOT = str(_Path(__file__).resolve().parent.parent)
-if _ROOT not in _sys.path:
-    _sys.path.insert(0, _ROOT)
 
 import difflib
 import os
@@ -1059,9 +1047,3 @@ def test_audio_coverage_gaps_skips_without_smils():
     assert result["skipped"] is True
     assert result["ok"] is True
 
-
-if __name__ == "__main__":
-    from _runner import run_module_tests
-
-    raise SystemExit(run_module_tests(globals()))
-    sys.exit(1 if failures else 0)

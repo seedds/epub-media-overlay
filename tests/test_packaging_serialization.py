@@ -12,18 +12,8 @@ Covers regressions:
     a duration and no fallback timing is available.
 
 Run:
-  /Users/f2pgod/Documents/spyder312/bin/python -m pytest tests/test_packaging_serialization.py -q
-or:
-  /Users/f2pgod/Documents/spyder312/bin/python tests/test_packaging_serialization.py
+  pytest tests/test_packaging_serialization.py -q
 """
-
-# Bootstrap: allow running this file directly (see conftest.py rationale).
-import sys as _sys
-from pathlib import Path as _Path
-
-_ROOT = str(_Path(__file__).resolve().parent.parent)
-if _ROOT not in _sys.path:
-    _sys.path.insert(0, _ROOT)
 
 import xml.dom.minidom as minidom
 
@@ -156,8 +146,3 @@ def test_get_audio_duration_uses_fallback_when_available():
     )
     assert result == 13.0
 
-
-if __name__ == "__main__":
-    from _runner import run_module_tests
-
-    raise SystemExit(run_module_tests(globals()))

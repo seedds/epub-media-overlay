@@ -35,7 +35,7 @@ Two pieces of shared context recur everywhere:
 | `mark_sentence.py` | XHTML linearize → segment → reconstruct; NLTK tokenizer setup |
 | `epub_reference_index.py` | Whole-EPUB `class`/`id` reference index that guides safe tag cleanup |
 | `transcription_backend.py` | Platform-aware backend selection (mlx / whisperx) + adapters |
-| `tests/` | Pytest suite (see [Tests](#tests)); each file also self-runs without pytest |
+| `tests/` | Pytest suite (see [Tests](#tests)) |
 | `requirements.txt` | Dependencies (platform-gated `whisperx` vs `mlx-whisperx`) |
 | `docs/sentence_segmentation.md` | Deep dive on sentence/segment boundary detection |
 | `run.py` | Local batch runner over a folder tree. **Gitignored**, not shipped |
@@ -319,7 +319,7 @@ tolerance, header-skip, minimum coverage, minimum contiguous run).
 
 Tests live in `tests/` and run under pytest (configured via `pyproject.toml`,
 which puts the repo root on `sys.path` so the flat source modules import by bare
-name). Each file also self-runs without pytest (e.g. `python tests/test_segmentation.py`).
+name).
 
 | File | Covers |
 | --- | --- |

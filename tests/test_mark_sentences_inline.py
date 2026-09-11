@@ -7,18 +7,8 @@ visible text (and therefore validate_text_consistency) unchanged. These tests pi
 that HTML5 inline formatting survives a segmentation round-trip.
 
 Run:
-  /Users/f2pgod/Documents/spyder312/bin/python -m pytest tests/test_mark_sentences_inline.py -q
-or:
-  /Users/f2pgod/Documents/spyder312/bin/python tests/test_mark_sentences_inline.py
+  pytest tests/test_mark_sentences_inline.py -q
 """
-
-# Bootstrap: allow running this file directly (see conftest.py rationale).
-import sys as _sys
-from pathlib import Path as _Path
-
-_ROOT = str(_Path(__file__).resolve().parent.parent)
-if _ROOT not in _sys.path:
-    _sys.path.insert(0, _ROOT)
 
 from bs4 import BeautifulSoup
 
@@ -68,8 +58,3 @@ def test_visible_text_preserved():
     new_text = BeautifulSoup(out, "lxml").get_text()
     assert orig_text == new_text
 
-
-if __name__ == "__main__":
-    from _runner import run_module_tests
-
-    raise SystemExit(run_module_tests(globals()))

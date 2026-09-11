@@ -15,20 +15,8 @@ There is also an optional integration test against the real Foundation EPUB, whi
 is skipped when that file is not present.
 
 Run:
-  /Users/f2pgod/Documents/spyder312/bin/python -m pytest tests/test_epub_reference_index.py -q
-or:
-  /Users/f2pgod/Documents/spyder312/bin/python tests/test_epub_reference_index.py
+  pytest tests/test_epub_reference_index.py -q
 """
-
-# Bootstrap: allow running this file directly.
-# Source modules are imported by bare name below, so the repo root must be on
-# sys.path before those imports. Under pytest, pyproject's pythonpath handles this.
-import sys as _sys
-from pathlib import Path as _Path
-
-_ROOT = str(_Path(__file__).resolve().parent.parent)
-if _ROOT not in _sys.path:
-    _sys.path.insert(0, _ROOT)
 
 import posixpath
 import zipfile
@@ -251,8 +239,3 @@ def test_foundation_reference_index_classifies_correctly():
     # Individual kobo span ids are targeted by nothing.
     assert "kobo.1.1" not in index.referenced_ids
 
-
-if __name__ == "__main__":
-    from _runner import run_module_tests
-
-    raise SystemExit(run_module_tests(globals()))

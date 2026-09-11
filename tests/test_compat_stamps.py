@@ -13,18 +13,8 @@ that re-validation real (closing the "existence/duration-only reconcile" holes):
   - atomic_write_json_local never leaves a truncated file at the final path.
 
 Run:
-  /Users/f2pgod/Documents/spyder312/bin/python -m pytest tests/test_compat_stamps.py -q
-or:
-  /Users/f2pgod/Documents/spyder312/bin/python tests/test_compat_stamps.py
+  pytest tests/test_compat_stamps.py -q
 """
-
-# Bootstrap: allow running this file directly (see conftest.py rationale).
-import sys as _sys
-from pathlib import Path as _Path
-
-_ROOT = str(_Path(__file__).resolve().parent.parent)
-if _ROOT not in _sys.path:
-    _sys.path.insert(0, _ROOT)
 
 import contextlib
 import json
@@ -39,7 +29,7 @@ import pipeline_core as pc
 
 @contextlib.contextmanager
 def _tmp():
-    """Fresh temp dir usable both under pytest and the standalone __main__ runner."""
+    """Fresh temp dir for one test."""
     with tempfile.TemporaryDirectory() as folder:
         yield folder
 
@@ -200,8 +190,3 @@ def test_atomic_write_json_local_no_partial_on_replace():
         # No leftover temp file.
         assert not os.path.exists(target + ".tmp")
 
-
-if __name__ == "__main__":
-    from _runner import run_module_tests
-
-    raise SystemExit(run_module_tests(globals()))
