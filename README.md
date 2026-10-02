@@ -15,7 +15,7 @@ This project provides a command-line pipeline that automatically resumes prior w
 
 ## Requirements
 
-- Python 3
+- Python 3.10+
 - `ffmpeg`
 - `ffprobe`
 

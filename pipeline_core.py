@@ -87,7 +87,7 @@ Typical keys include:
 
 - `folder_name`: working directory for one book
 - `audio_file`: source audiobook path/name
-- `epub_file`: working EPUB path/name used for matching
+- `epub_file`: copied source EPUB (never marked) used for matching
 - `out_file`: working `.epub3` file (basename inside `folder_name`) that gets
   mutated and finally moved to the caller-supplied package path
 - `opf_file`, `opf_dir`: package metadata derived from the working EPUB
@@ -148,6 +148,7 @@ High-risk areas
 
 import difflib
 import glob
+import hashlib
 import io
 import json
 import math
@@ -555,21 +556,63 @@ def get_primary_audio_stream_duration(audio_path):
 # Note: artifacts produced before stamps existed have no `.meta`, so the first run
 # after this change re-splits and re-transcribes. That is intentional -- accepting a
 # stampless artifact would reintroduce the exact hole this closes.
+#
+# A chunk stamp also identifies the source audio (`source_audio`), so a different
+# recording used with the same EPUB re-cuts every chunk instead of reusing chunks
+# whose start/end happen to coincide. It no longer records `chunk_seconds`: start/end
+# already pin the plan, and for chaptered audio the option does not affect it at all.
+# Older chunk stamps (with `chunk_seconds`, without `source_audio`) are still accepted
+# and are never rewritten: transcript stamps embed the chunk stamp as it is on disk,
+# so leaving it untouched keeps those transcripts valid too.
 
 
 def _stamp_path_for(artifact_path):
     return f"{artifact_path}.meta"
 
 
+_SOURCE_AUDIO_SAMPLE_BYTES = 1024 * 1024
+_SOURCE_AUDIO_IDENTITY_CACHE = {}
+
+
+def source_audio_identity(book_info):
+    """Content identity of the source audiobook the chunks are cut from, or None.
+
+    Size plus a SHA-256 of the first and last MiB: cheap on a multi-GB audiobook, yet a
+    different recording never matches, and merely touching the file does not invalidate
+    hours of transcripts. Cached per (path, size, mtime_ns) because a stamp is built for
+    every chunk on every completeness check.
+    """
+    audio_file = book_info.get("audio_file")
+    if not audio_file:
+        return None
+    path = resolve_book_path(book_info, audio_file)
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    key = (path, stat.st_size, stat.st_mtime_ns)
+    identity = _SOURCE_AUDIO_IDENTITY_CACHE.get(key)
+    if identity is None:
+        hasher = hashlib.sha256()
+        with open(path, "rb") as handle:
+            hasher.update(handle.read(_SOURCE_AUDIO_SAMPLE_BYTES))
+            if stat.st_size > _SOURCE_AUDIO_SAMPLE_BYTES:
+                handle.seek(max(_SOURCE_AUDIO_SAMPLE_BYTES, stat.st_size - _SOURCE_AUDIO_SAMPLE_BYTES))
+                hasher.update(handle.read())
+        identity = {"size": stat.st_size, "head_tail_sha256": hasher.hexdigest()}
+        _SOURCE_AUDIO_IDENTITY_CACHE[key] = identity
+    return identity
+
+
 def chunk_compatibility_stamp(book_info, chunk_info):
     """Config that must match for a preserved audio chunk to be reused as-is."""
     return {
         "kind": "audio_chunk",
+        "source_audio": source_audio_identity(book_info),
         "audio_codec": book_info.get("audio_codec", "copy"),
         "audio_bitrate": book_info.get("audio_bitrate"),
         "audio_sample_rate": book_info.get("audio_sample_rate"),
         "audio_channels": book_info.get("audio_channels"),
-        "chunk_seconds": book_info.get("chunk_seconds"),
         "start_time": str(chunk_info["start_time"]),
         "end_time": str(chunk_info["end_time"]),
     }
@@ -609,6 +652,26 @@ def read_compatibility_stamp(artifact_path):
 def stamp_matches(artifact_path, expected_stamp):
     """True if the artifact has a stamp equal to expected_stamp."""
     return read_compatibility_stamp(artifact_path) == expected_stamp
+
+
+# Keys that older chunk stamps carry but that no longer decide reuse.
+_LEGACY_CHUNK_STAMP_KEYS = ("chunk_seconds",)
+
+
+def chunk_stamp_matches(chunk_path, expected_stamp):
+    """True if the chunk's stamp matches, accepting the older stamp format.
+
+    An older stamp may carry `chunk_seconds` (ignored) and lacks `source_audio` (then
+    not compared). See the note at the top of this section.
+    """
+    stored = read_compatibility_stamp(chunk_path)
+    if not isinstance(stored, dict):
+        return False
+    stored = {key: value for key, value in stored.items() if key not in _LEGACY_CHUNK_STAMP_KEYS}
+    expected = dict(expected_stamp)
+    if "source_audio" not in stored:
+        expected.pop("source_audio", None)
+    return stored == expected
 
 
 def is_transcript_complete(book_info, chunk_basename):
@@ -657,7 +720,7 @@ def is_audio_chunk_complete(
     # The chunk must have been produced by the current audio config, not merely be a
     # file of the right duration. Without this, a chunk stream-copied in a prior run
     # would pass the duration check after the user switched to (e.g.) aac/64k.
-    if not stamp_matches(output_path, chunk_compatibility_stamp(book_info, chunk_info)):
+    if not chunk_stamp_matches(output_path, chunk_compatibility_stamp(book_info, chunk_info)):
         return False
 
     expected_duration = expected_chunk_duration(chunk_info)

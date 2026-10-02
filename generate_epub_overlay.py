@@ -488,14 +488,15 @@ def derived_artifact_paths(stage: str, paths: RuntimePaths) -> list[Path]:
 
     Audio chunks and transcripts (split/transcribe) are deliberately absent: they are
     expensive, and their per-artifact compatibility stamps already decide reuse.
-    The segment stage's derived state includes the working EPUB because it carries
-    the injected segment ids; deleting it makes the segment stage refresh from the
-    source copy before re-marking.
+    The working EPUB is absent too: it belongs to prepare, and later stages of the
+    same run still need it. Segment ids left in it are harmless because segment
+    reconcile trusts only the snapshot and the segment stage refreshes the working
+    EPUB from the source copy before re-marking.
     """
     if stage == "match":
         return [paths.matched_list_path]
     if stage == "segment":
-        return [paths.segmented_snapshot_path, paths.working_epub_path]
+        return [paths.segmented_snapshot_path]
     if stage == "smil":
         return sorted(paths.run_dir.glob("*.smil")) if paths.run_dir.is_dir() else []
     if stage == "package":
@@ -531,8 +532,14 @@ def reset_derived_artifacts(paths: RuntimePaths, source_epub: Path) -> None:
     are never destroyed automatically; the stage reconcile step re-validates every
     chunk/transcript against the current config via its compatibility stamp and
     re-derives whatever is stale.
+
+    The working EPUB is removed too, so prepare re-runs and re-copies the (possibly
+    changed) inputs instead of reconciling against copies of the old ones.
     """
     remove_derived_artifacts([s for s in STAGES if s not in ("prepare", "split", "transcribe")], paths, source_epub)
+    working_epub = paths.working_epub_path
+    if working_epub.is_file() and working_epub.resolve() != source_epub.resolve():
+        working_epub.unlink()
 
 
 def invalidate_downstream(stage: str, config: PipelineConfig, paths: RuntimePaths, state: dict[str, Any]) -> None:
@@ -669,10 +676,10 @@ def build_book_info(state: dict[str, Any], paths: RuntimePaths, matched_list: li
 def refresh_working_epub(config: PipelineConfig, paths: RuntimePaths) -> dict[str, Any]:
     """Re-copy the source EPUB into the working `.epub3` and return fresh book_info."""
     book_info = book_info_from_config(config, paths)
-    audio_file, _source_epub, out_file = pipeline_core.preprocess(
+    audio_file, source_epub, out_file = pipeline_core.preprocess(
         book_info, paths.run_dir / config.epub.name
     )
-    book_info.update({"audio_file": audio_file, "epub_file": out_file, "out_file": out_file})
+    book_info.update({"audio_file": audio_file, "epub_file": source_epub, "out_file": out_file})
     return book_info
 
 
@@ -701,7 +708,7 @@ def build_prepared_book_info_from_artifacts(
     book_info = book_info_from_config(config, paths)
     book_info.update(
         {
-            "epub_file": working_epub.name,
+            "epub_file": copied_epub.name,
             "out_file": working_epub.name,
             "opf_file": opf_file,
             "opf_dir": str(Path(opf_file).parent),
@@ -876,15 +883,14 @@ def reconcile_stage_from_artifacts(
         html_files = unique_html_files(matched_list)
         if not html_files:
             return None
-        working_epub_path = paths.run_dir / book_info["out_file"]
-        snapshot_has_segments = epub_contains_segment_ids(paths.segmented_snapshot_path, html_files)
-        working_has_segments = epub_contains_segment_ids(working_epub_path, html_files)
-        if not snapshot_has_segments and not working_has_segments:
+        # Only the snapshot is trusted: it is deleted whenever an upstream stage re-runs,
+        # whereas the working EPUB may still carry segment ids marked against an older
+        # match. Without a snapshot the segment stage re-marks from the source copy; with
+        # one, the working EPUB is always restored from it (it holds no audio yet, so the
+        # copy is cheap).
+        if not epub_contains_segment_ids(paths.segmented_snapshot_path, html_files):
             return None
-        if snapshot_has_segments and not working_has_segments:
-            atomic_copy(paths.segmented_snapshot_path, working_epub_path)
-        elif working_has_segments and not snapshot_has_segments:
-            atomic_copy(working_epub_path, paths.segmented_snapshot_path)
+        atomic_copy(paths.segmented_snapshot_path, paths.run_dir / book_info["out_file"])
         state.setdefault("artifacts", {})["matched_html_files"] = html_files
         return {"html_files": html_files, "snapshot": str(paths.segmented_snapshot_path)}
 
@@ -974,8 +980,10 @@ def run_prepare_stage(
     atomic_copy(config.epub, copied_epub)
 
     book_info = book_info_from_config(config, paths)
-    audio_file, _epub_file, out_file = pipeline_core.preprocess(book_info, copied_epub)
-    book_info.update({"audio_file": audio_file, "epub_file": out_file, "out_file": out_file})
+    # Matching reads the untouched source copy (`epub_file`); only the working `.epub3`
+    # (`out_file`) is marked and packaged, so matching never depends on segment state.
+    audio_file, epub_file, out_file = pipeline_core.preprocess(book_info, copied_epub)
+    book_info.update({"audio_file": audio_file, "epub_file": epub_file, "out_file": out_file})
 
     state["book_info"] = book_info
     state["artifacts"]["prepared_epub"] = str(paths.run_dir / out_file)

@@ -68,9 +68,9 @@ This is the backbone of the orchestrator and the part most worth understanding.
 
 - **Reset preserves expensive work.** When the signature no longer matches, the
   *derived downstream* artifacts are deleted: `matched_list.json`,
-  `segmented.epub3`, the working `run/<stem>.epub3` (it carries segment ids),
-  `run/*.smil`, `validation.json`, the packaged `<work>/<stem>.epub` **and the
-  final output EPUB**. Only these known paths are removed, never a wildcard over
+  `segmented.epub3`, `run/*.smil`, `validation.json`, the packaged
+  `<work>/<stem>.epub` **and the final output EPUB**. The working
+  `run/<stem>.epub3` is deleted as well, so prepare re-copies the changed inputs. Only these known paths are removed, never a wildcard over
   the work-dir root (which may hold unrelated EPUBs). The audio chunks and
   transcripts in `run/` are **never** thrown away by a reset; their compatibility
   stamps decide reuse per artifact. Transcription is slow and non-deterministic,
@@ -81,7 +81,9 @@ This is the backbone of the orchestrator and the part most worth understanding.
   stages reset to pending. A re-run match therefore always leads to a re-run
   segment/smil/package/validate; a packaged EPUB can never be reused against a
   newer SMIL set. `prepare` is exempt (it re-runs after every completed run because
-  packaging moves the working EPUB away, without changing any input).
+  packaging moves the working EPUB away, without changing any input). The working
+  EPUB itself is never deleted here: later stages of the same run still need it, and
+  any segment ids it still carries are ignored (see `segment` below).
 
 - **Per-stage reconciliation is the real resume engine.** On every run, before
   running a stage, the orchestrator re-validates that stage's on-disk artifacts
@@ -99,8 +101,10 @@ This is the backbone of the orchestrator and the part most worth understanding.
     equals the current transcript set and every matched transcript is in it. Some
     transcripts legitimately match nothing (intro/outro chunks), so "every
     transcript appears in the matched list" is deliberately *not* the test.
-  - `segment` keeps the working EPUB and the `segmented.epub3` snapshot in sync:
-    whichever one already has segment ids is copied to the other.
+  - `segment` trusts only the `segmented.epub3` snapshot (deleted whenever an
+    upstream stage re-runs) and restores the working EPUB from it. Segment ids in the
+    working EPUB alone are never reused: they may have been marked against an older
+    match.
   - `package` accepts the final output EPUB or the working packaged EPUB only if
     it is byte-identical (size + SHA-256) to the package this state recorded and
     contains every expected `audio/` and `smil/` entry; the missing copy is
@@ -165,6 +169,12 @@ non-obvious decisions — the things that look wrong until you know why.
   encoder priming delay and frame padding make the reported duration drift more
   than a second; without it, valid chunks would read as "incomplete" and trigger
   a needless full re-split.
+- **Chunk stamps.** Each chunk's `.meta` stamp records the codec settings, its
+  start/end and an identity of the source audio (size + SHA-256 of its first and
+  last MiB), so a different recording never reuses old chunks. It does not record
+  `--chunk-seconds` (start/end already pin the plan). Older stamps, with
+  `chunk_seconds` and without the source identity, are still accepted and never
+  rewritten, because transcript stamps embed the chunk stamp as it is on disk.
 - **Reuse + bounded parallelism.** Existing complete chunks are skipped on
   re-runs. Splitting is serial for a single chunk or `--split-jobs 1`; otherwise
   a thread pool (clamped to `[1, cpu_count]`) cuts chunks in parallel and cancels
@@ -192,6 +202,8 @@ This is the most subtle code in the project. It maps each transcript chunk onto
 the right HTML file(s), tolerating that chapter audio and chapter text rarely
 line up one-to-one.
 
+- **Reads the untouched source copy** (`book_info["epub_file"]`, `run/<stem>.epub`),
+  not the working `.epub3`, so matching never depends on segment state.
 - **Spine order, not filename order.** HTML is walked in OPF spine order. Front
   matter, appendices, and generated nav files sort unpredictably by filename, so
   spine order is the authoritative reading order and gives a monotonic
@@ -272,7 +284,8 @@ agree on what a "token" is.
     whitespace-only wrapper tags that serialize inconsistently. Every container
     found inside a leaf block is treated as a formatting wrapper and re-emitted
     (an allowlist used to drop unlisted tags silently); `INLINE_TAGS` now only
-    tells the cleanup which empty leftovers may be removed.
+    tells the cleanup which empty leftovers may be removed. A wrapper split across
+    several runs keeps its `id` only on the first copy, so no id is duplicated.
   - Leaf blocks include table cells and captions (`td`, `th`, `caption`) so table
     text is highlightable; a block whose direct children include another block
     is skipped in favour of its children.
@@ -395,10 +408,10 @@ name).
 | `tests/test_mark_sentences_inline.py` | `mark_sentences` round-trips: inline tags survive, reference-index semantics (None skips cleanup), text integrity, anchor placement, CSS link |
 | `tests/test_html_cleaner.py` | `preprocess_remove_redundant_tags`: unreferenced class/id stripping, bare-span unwrap, empty-tag removal, safety controls |
 | `tests/test_epub_reference_index.py` | `epub_reference_index`: CSS (incl. `:not()`/`:is()` arguments, `@media`), link/NCX/OPF-guide fragments, JS tokens; optional integration test against a real EPUB |
-| `tests/test_compat_stamps.py` | Chunk/transcript compatibility stamps and atomic JSON writes |
+| `tests/test_compat_stamps.py` | Chunk/transcript compatibility stamps (incl. source-audio identity and older-format stamps) and atomic JSON writes |
 | `tests/test_split_plan.py` | Chunk planning (edge snapping) and stale-chunk pruning |
 | `tests/test_packaging_serialization.py` | OPF serialization, media types, `find_opf_path`, folder-addressed `preprocess`/`merge_files`/`post_processing_opf`, validation inventory |
-| `tests/test_orchestrator_state.py` | Reset scope, downstream invalidation, package/match/split reconcile rules |
+| `tests/test_orchestrator_state.py` | Reset scope, downstream invalidation, package/match/split/segment reconcile rules, and the full stage sequence (first run, resume, reset) with a stubbed engine |
 | `tests/test_transcription_backend.py` | whisperx model caching and release |
 
 Run the whole suite:

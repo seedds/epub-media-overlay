@@ -10,6 +10,8 @@ that re-validation real (closing the "existence/duration-only reconcile" holes):
     current model/language/backend AND its parent chunk stamp;
   - a stampless artifact (e.g. from a crash before the stamp was written, or from a
     pre-stamp run) is rejected so it gets re-derived;
+  - a chunk stamp identifies the source audio and ignores chunk_seconds, while older
+    stamps (chunk_seconds, no source identity) are still accepted;
   - atomic_write_json_local never leaves a truncated file at the final path.
 
 Run:
@@ -61,6 +63,13 @@ def _chunk_info(idx=0, start="0", end="600"):
     }
 
 
+def _with_source_audio(folder, content=b"source-audio", **overrides):
+    """book_info whose `audio_file` names a real (fake) source audiobook in `folder`."""
+    with open(os.path.join(str(folder), "book.m4b"), "wb") as handle:
+        handle.write(content)
+    return _book_info(folder, audio_file="book.m4b", **overrides)
+
+
 def _make_chunk_with_stamp(folder, book_info, chunk_info):
     """Create a fake chunk file plus its compatibility stamp (as split would)."""
     chunk_path = os.path.join(str(folder), chunk_info["output_name"])
@@ -96,7 +105,16 @@ def test_chunk_stamp_reflects_audio_config():
         assert stamp["audio_codec"] == "aac"
         assert stamp["audio_bitrate"] == "64k"
         assert stamp["audio_sample_rate"] == 24000
-        assert stamp["chunk_seconds"] == 600
+        # start/end already pin the plan; chunk_seconds does not affect chaptered audio.
+        assert "chunk_seconds" not in stamp
+
+
+def test_chunk_stamp_identifies_source_audio():
+    with _tmp() as folder:
+        info = _with_source_audio(folder, b"x" * 10)
+        identity = pc.chunk_compatibility_stamp(info, _chunk_info())["source_audio"]
+        assert identity["size"] == 10
+        assert len(identity["head_tail_sha256"]) == 64
 
 
 def test_stamp_roundtrip_matches():
@@ -105,6 +123,71 @@ def test_stamp_roundtrip_matches():
         chunk = _chunk_info()
         path = _make_chunk_with_stamp(folder, info, chunk)
         assert pc.stamp_matches(path, pc.chunk_compatibility_stamp(info, chunk))
+
+
+def test_legacy_chunk_stamp_is_still_accepted():
+    # Stamps written before the source identity existed carry chunk_seconds and no
+    # source_audio. Rejecting them would re-split and re-transcribe every book.
+    with _tmp() as folder:
+        info = _with_source_audio(folder)
+        chunk = _chunk_info()
+        path = os.path.join(str(folder), chunk["output_name"])
+        with open(path, "wb") as handle:
+            handle.write(b"\x00")
+        legacy = pc.chunk_compatibility_stamp(info, chunk)
+        del legacy["source_audio"]
+        legacy["chunk_seconds"] = 600
+        pc.write_compatibility_stamp(path, legacy)
+        assert pc.chunk_stamp_matches(path, pc.chunk_compatibility_stamp(info, chunk))
+
+
+def test_legacy_chunk_stamp_still_rejects_a_codec_change():
+    with _tmp() as folder:
+        info = _with_source_audio(folder)
+        chunk = _chunk_info()
+        path = _make_chunk_with_stamp(folder, info, chunk)
+        legacy = pc.read_compatibility_stamp(path)
+        del legacy["source_audio"]
+        pc.write_compatibility_stamp(path, legacy)
+        changed = _with_source_audio(folder, audio_bitrate="128k")
+        assert not pc.chunk_stamp_matches(path, pc.chunk_compatibility_stamp(changed, chunk))
+
+
+def test_chunk_seconds_change_keeps_chunk():
+    with _tmp() as folder:
+        info = _with_source_audio(folder, chunk_seconds=600)
+        chunk = _chunk_info()
+        path = _make_chunk_with_stamp(folder, info, chunk)
+        changed = _with_source_audio(folder, chunk_seconds=900)
+        assert pc.chunk_stamp_matches(path, pc.chunk_compatibility_stamp(changed, chunk))
+
+
+def test_different_source_audio_invalidates_chunk_and_transcript():
+    with _tmp() as folder:
+        info = _with_source_audio(folder, b"first recording")
+        chunk = _chunk_info()
+        path = _make_chunk_with_stamp(folder, info, chunk)
+        _make_transcript_with_stamp(folder, info, chunk)
+
+        other = _with_source_audio(folder, b"a different recording")
+        assert not pc.chunk_stamp_matches(path, pc.chunk_compatibility_stamp(other, chunk))
+        # Split then re-cuts the chunk, which rewrites its stamp; the old transcript's
+        # stamp embeds the old chunk stamp and is rejected.
+        _make_chunk_with_stamp(folder, other, chunk)
+        assert not pc.is_transcript_complete(other, chunk["output_name"])
+
+
+def test_audio_chunk_complete_accepts_legacy_stamp(monkeypatch):
+    monkeypatch.setattr(pc, "get_primary_audio_stream_duration", lambda path: 600.0)
+    with _tmp() as folder:
+        info = _with_source_audio(folder)
+        chunk = _chunk_info()
+        path = _make_chunk_with_stamp(folder, info, chunk)
+        legacy = pc.read_compatibility_stamp(path)
+        del legacy["source_audio"]
+        legacy["chunk_seconds"] = 600
+        pc.write_compatibility_stamp(path, legacy)
+        assert pc.is_audio_chunk_complete(info, chunk)
 
 
 def test_missing_stamp_never_matches():
@@ -152,7 +235,7 @@ def test_transcript_stale_when_language_changes():
 
 
 def test_transcript_stale_when_parent_chunk_recut():
-    # Re-cutting the chunk (e.g. new chunk_seconds) rewrites the chunk stamp; the old
+    # Re-cutting the chunk (e.g. a new bitrate) rewrites the chunk stamp; the old
     # transcript, whose stamp embeds the OLD chunk stamp, must be rejected.
     with _tmp() as folder:
         info = _book_info(folder)
@@ -160,7 +243,7 @@ def test_transcript_stale_when_parent_chunk_recut():
         _make_chunk_with_stamp(folder, info, chunk)
         _make_transcript_with_stamp(folder, info, chunk)
 
-        recut = _book_info(folder, chunk_seconds=300)
+        recut = _book_info(folder, audio_bitrate="128k")
         _make_chunk_with_stamp(folder, recut, chunk)  # rewrite chunk stamp only
         assert not pc.is_transcript_complete(recut, chunk["output_name"])
 

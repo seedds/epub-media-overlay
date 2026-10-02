@@ -258,3 +258,120 @@ def test_split_reconcile_prunes_chunks_outside_the_plan(tmp_path, monkeypatch):
     assert not (paths.run_dir / "099.m4a").exists()
     assert not (paths.run_dir / "099.json").exists()
     assert (paths.run_dir / "000.json").exists()
+
+
+# --- the working EPUB survives stage invalidation --------------------------------
+
+
+def test_invalidate_after_split_keeps_working_epub(tmp_path):
+    # Match (and every later stage of the same run) still needs the working EPUB;
+    # deleting it here made every fresh run fail at match.
+    config, paths = _config_and_paths(tmp_path)
+    _touch(paths.working_epub_path, paths.segmented_snapshot_path, paths.matched_list_path)
+    state = geo.default_state({}, config, paths)
+    geo.invalidate_downstream("split", config, paths, state)
+    assert paths.working_epub_path.exists()
+    assert not paths.segmented_snapshot_path.exists()
+    assert not paths.matched_list_path.exists()
+
+
+def test_segment_reconcile_ignores_ids_only_in_working_epub(tmp_path, monkeypatch):
+    # Segment ids in the working EPUB alone may have been marked against an older
+    # match; only the snapshot (deleted on every upstream re-run) is trusted.
+    config, paths = _config_and_paths(tmp_path)
+    state = _prepared_state(config, paths)
+    monkeypatch.setattr(geo, "epub_contains_segment_ids", lambda path, html: path == paths.working_epub_path)
+    assert geo.reconcile_stage_from_artifacts("segment", config, paths, state) is None
+
+
+# --- end to end: the stage sequence with a stubbed engine -------------------------
+
+
+_E2E_CONTAINER = (
+    '<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" '
+    'version="1.0"><rootfiles><rootfile full-path="OEBPS/content.opf" '
+    'media-type="application/oebps-package+xml"/></rootfiles></container>'
+)
+_E2E_OPF = (
+    '<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0">'
+    "<metadata/><manifest>"
+    '<item id="c" href="ch1.xhtml" media-type="application/xhtml+xml"/>'
+    '</manifest><spine><itemref idref="c"/></spine></package>'
+)
+
+
+def _stub_engine(monkeypatch, calls):
+    """Replace ffmpeg/ffprobe/ASR with stand-ins; everything else runs for real."""
+    plan = [{"id": 0, "start_time": "0", "end_time": "50", "output_name": "000.m4a"}]
+
+    def split(book_info):
+        calls["split"] += 1
+        Path(pc.resolve_book_path(book_info, "000.m4a")).write_bytes(b"a")
+        return {"created_chunk_count": 1}
+
+    def transcribe(book_info):
+        calls["transcribe"] += 1
+        words = [{"word": "word", "start": i, "end": i + 0.5} for i in range(50)]
+        Path(pc.resolve_book_path(book_info, "000.json")).write_text(json.dumps({"word_segments": words}))
+
+    real_link = pc.link_html_with_audio
+
+    def link(book_info):
+        calls["match"] += 1
+        return real_link(book_info)
+
+    monkeypatch.setattr(geo, "preflight", lambda *a, **k: None)
+    monkeypatch.setattr(geo, "release_models", lambda: None)
+    monkeypatch.setattr(pc, "plan_audio_chunks", lambda book_info, audio_path=None: plan)
+    monkeypatch.setattr(
+        pc, "is_audio_chunk_complete",
+        lambda book_info, chunk, tolerance=None: Path(pc.resolve_book_path(book_info, chunk["output_name"])).exists(),
+    )
+    monkeypatch.setattr(
+        pc, "is_transcript_complete",
+        lambda book_info, name: Path(pc.resolve_book_path(book_info, "000.json")).exists(),
+    )
+    monkeypatch.setattr(pc, "split_audio", split)
+    monkeypatch.setattr(pc, "transcribe_audio", transcribe)
+    monkeypatch.setattr(pc, "link_html_with_audio", link)
+    monkeypatch.setattr(pc, "get_audio_duration", lambda path: 50.0)
+
+
+def _e2e_config(tmp_path, **overrides):
+    config, _paths = _config_and_paths(tmp_path)
+    with zipfile.ZipFile(config.epub, "w") as zf:
+        zf.writestr("mimetype", "application/epub+zip")
+        zf.writestr("META-INF/container.xml", _E2E_CONTAINER)
+        zf.writestr("OEBPS/content.opf", _E2E_OPF)
+        zf.writestr("OEBPS/ch1.xhtml", "<html><head></head><body><p>" + "word " * 50 + "</p></body></html>")
+    return geo.PipelineConfig(**{**config.__dict__, "output_dir": tmp_path / "out", **overrides})
+
+
+def _stage_statuses(config):
+    state = json.loads((config.work_dir / "state.json").read_text())
+    return {stage: state["stages"][stage]["status"] for stage in geo.STAGES}
+
+
+def test_pipeline_first_run_resume_and_reset(tmp_path, monkeypatch):
+    calls = {"split": 0, "transcribe": 0, "match": 0}
+    _stub_engine(monkeypatch, calls)
+    config = _e2e_config(tmp_path)
+    output = geo.build_paths(config).output_path
+
+    # First run: every stage executes, and match finds the working EPUB it reads.
+    assert geo.run_pipeline(config) == 0
+    assert set(_stage_statuses(config).values()) == {"success"}
+    assert calls == {"split": 1, "transcribe": 1, "match": 1}
+    assert output.exists()
+
+    # Resume: split, transcribe and match are reused.
+    assert geo.run_pipeline(config) == 0
+    assert calls == {"split": 1, "transcribe": 1, "match": 1}
+
+    # Signature reset (batch size changed): chunks/transcripts survive, match re-runs
+    # against freshly prepared inputs and the run completes.
+    reset = geo.PipelineConfig(**{**config.__dict__, "batch_size": 2})
+    assert geo.run_pipeline(reset) == 0
+    assert calls == {"split": 1, "transcribe": 1, "match": 2}
+    assert set(_stage_statuses(reset).values()) == {"success"}
+    assert output.exists()

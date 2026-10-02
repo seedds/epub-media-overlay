@@ -213,3 +213,28 @@ def test_table_cells_are_segmented():
     assert soup.td.find("span", id=lambda v: v and "-segment" in v) is not None
     assert soup.th.find("span", id=lambda v: v and "-segment" in v) is not None
     assert soup.caption.find("span", id=lambda v: v and "-segment" in v) is not None
+
+
+# --- a wrapper split across runs keeps its id once -----------------------------
+
+
+def _ids(out, value):
+    return BeautifulSoup(out, "lxml").find_all(id=value)
+
+
+def test_id_wrapper_with_nested_formatting_keeps_one_id():
+    # The <span> is re-created for each run (before, inside and after the <i>); only
+    # the first copy may keep the id, or the document carries duplicate ids.
+    out = _segmented('<p><span id="x1">Some text <i>here</i> more text.</span></p>')
+    spans = _ids(out, "x1")
+    assert len(spans) == 1
+    assert spans[0].get_text() == "Some text "
+
+
+def test_id_anchor_across_sentences_keeps_one_id_in_first_segment():
+    out = _segmented('<p><a id="n1" href="#f1">First sentence. Second sentence.</a></p>')
+    anchors = _ids(out, "n1")
+    assert len(anchors) == 1
+    assert anchors[0].find_parent("span")["id"].endswith("-segment1")
+    # Every copy still links to the target.
+    assert len(BeautifulSoup(out, "lxml").find_all("a", href="#f1")) == 2

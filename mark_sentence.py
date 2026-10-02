@@ -750,11 +750,23 @@ def _clone_tag_shell(node: Tag) -> Tag:
     return Tag(name=node.name, attrs=dict(node.attrs))
 
 
-def _wrap_with_format_stack(node: Union[Tag, NavigableString], fmt_stack: List[Tag]):
+def _wrap_with_format_stack(
+    node: Union[Tag, NavigableString], fmt_stack: List[Tag], emitted_ids: set
+):
     # `fmt_stack` is stored outermost -> innermost, so wrap in reverse order.
+    # A wrapper is re-created for every run it spans (formatting change, void tag,
+    # segment boundary). Only the first copy keeps its `id`: that is where the original
+    # element started (the right fragment target), and a repeat would be a duplicate id.
     wrapped_node = node
     for fmt in reversed(fmt_stack):
-        wrapper = Tag(name=fmt.name, attrs=dict(fmt.attrs))
+        attrs = dict(fmt.attrs)
+        wrapper_id = attrs.get("id")
+        if wrapper_id:
+            if wrapper_id in emitted_ids:
+                del attrs["id"]
+            else:
+                emitted_ids.add(wrapper_id)
+        wrapper = Tag(name=fmt.name, attrs=attrs)
         wrapper.append(wrapped_node)
         wrapped_node = wrapper
     return wrapped_node
@@ -772,6 +784,8 @@ def _create_segment_spans(
     # emitted at those positions.
     new_content: List[Tag] = []
     counter = start_counter
+    # Wrapper ids already emitted in this block; see _wrap_with_format_stack.
+    emitted_ids: set = set()
     zero_width_lookup = {}
     for position, node, fmt_stack in zero_width_nodes:
         zero_width_lookup.setdefault(position, []).append((node, fmt_stack))
@@ -788,13 +802,13 @@ def _create_segment_spans(
         while current_idx < end:
             # Emit zero-width nodes before consuming the visible item at this offset.
             for node, fmt_stack in zero_width_lookup.get(current_idx, []):
-                segment_span.append(_wrap_with_format_stack(node, fmt_stack))
+                segment_span.append(_wrap_with_format_stack(node, fmt_stack, emitted_ids))
 
             item, fmt_stack = char_map[current_idx]
 
             # Case A: restore an atomic non-text node from its placeholder position.
             if isinstance(item, Tag):
-                segment_span.append(_wrap_with_format_stack(item, fmt_stack))
+                segment_span.append(_wrap_with_format_stack(item, fmt_stack, emitted_ids))
                 current_idx += 1
                 continue
 
@@ -816,7 +830,9 @@ def _create_segment_spans(
 
             text_str = "".join(text_buffer)
             if text_str.strip():
-                wrapped_node = _wrap_with_format_stack(NavigableString(text_str), fmt_stack)
+                wrapped_node = _wrap_with_format_stack(
+                    NavigableString(text_str), fmt_stack, emitted_ids
+                )
             else:
                 # Keep pure whitespace raw. Wrapping whitespace-only content in inline
                 # tags tends to create serializer-dependent junk.
@@ -834,7 +850,7 @@ def _create_segment_spans(
     # append and left an empty formatting wrapper behind in the earlier segment.)
     if new_content:
         for node, fmt_stack in zero_width_lookup.get(len(char_map), []):
-            new_content[-1].append(_wrap_with_format_stack(node, fmt_stack))
+            new_content[-1].append(_wrap_with_format_stack(node, fmt_stack, emitted_ids))
 
     return new_content
 
